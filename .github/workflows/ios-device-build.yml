@@ -16,6 +16,9 @@ jobs:
           sudo xcode-select -s /Applications/Xcode.app
           xcodebuild -version
 
+      - name: Make git SHA script executable
+        run: chmod +x tools/stamp-git-sha.sh
+
       - name: Build for iPhone
         run: |
           set -o pipefail
