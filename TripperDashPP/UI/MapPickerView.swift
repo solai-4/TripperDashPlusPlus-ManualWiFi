@@ -1,0 +1,1782 @@
+//
+//  MapPickerView.swift
+//  TripperDashPP
+//
+//  Phase 7 (full) — top-level navigation experience.
+//
+//  Architecture: the picker has FOUR mutually exclusive UI phases:
+//
+//    • .picking     — live MKMapView + sticky search bar + quick access
+//                      tiles, connect / "Start navigation" CTA, no stream running.
+//                      feat/route-waypoints: when a plan is being built
+//                      (status.plannedRoute != nil) the picking phase
+//                      shows the PLANNING UI instead (PlanningMapView +
+//                      WaypointListView). Both live in .picking with the
+//                      stream OFF, so the GPU-pool mutual-exclusion rule
+//                      is preserved.
+//    • .navigating  — NavigationHUD on phone (ETA/turn/distance),
+//                      MapViewSource pushing frames to dash.
+//    • .freeRiding  — FreeRideHUD on phone, MapViewSource streaming the
+//                      map to the dash with no route.
+//    • .transitioning — brief blank state (~500 ms) between the above
+//                      so Apple Maps' shared GPU pool drains before we
+//                      swap the live MKMapView <-> the BG tile renderer.
+//
+//  See CLAUDE.md → "Architecture summary" and the `royal-enfield-tripper-dash`
+//  skill's `references/ios-map-renderer.md` for the GPU-pool rationale.
+//
+
+import CoreLocation
+import MapKit
+import SwiftUI
+
+struct MapPickerView: View {
+    @Environment(AppStatus.self) private var status
+    @Environment(\.scenePhase) private var scenePhase
+
+    @State private var locationToken: UUID?
+    @State private var transitioning = false
+    @State private var showSettings = false
+    @State private var showSavedRoutes = false
+    @State private var showRideHistory = false
+
+    /// Armed when the rider taps "Connect & start navigation" while a plan
+    /// is laid out — i.e. they intend to ride, not just connect. When the
+    /// link then reaches `.connected`, we auto-start navigation instead of
+    /// making them tap a second button. Cleared on start, on a failed/
+    /// cancelled connect, or if the plan disappears. Deliberately NOT set
+    /// by the plain "Connect to dash" (no plan) path, nor by reconnects.
+    @State private var pendingAutoStart = false
+    /// Presents the bike chooser (confirmationDialog) when the rider taps
+    /// Connect with more than one saved bike.
+    @State private var showBikePicker = false
+
+    /// Tile pre-render progress (0.0 = idle/done, 0…<1 = in flight).
+    /// We use a single shared sheet that watches `prerenderActive`.
+    @State private var prerenderActive = false
+    @State private var prerenderProgress: Double = 0
+    /// The 4 s arrival auto-dismiss. Cancelled whenever navigation ends or
+    /// restarts first, so a late `finishArrival()` can't start a free ride
+    /// after the rider pressed Stop.
+    @State private var arrivalTask: Task<Void, Never>?
+
+    // Sheet flags
+    @State private var showSearch = false
+    /// Seed text passed into DestinationSearchSheet when opened via a
+    /// "Share to TripperDash++" fallback (un-geocodable shared link).
+    @State private var sharedSearchSeed: String? = nil
+    @State private var showFavoriteEditor = false
+    @State private var favoriteEditorSeed: Destination?
+    /// The destination currently selected on the home map: drives both
+    /// the red pin and the compact preview card. Replaces the old
+    /// `droppedPin` + `previewDestination` (modal sheet) pair — the card
+    /// is now an inline overlay so the map stays live underneath and the
+    /// rider can tap a neighbouring point to retarget.
+    @State private var selectedDestination: Destination?
+    /// One-shot camera focus request handed to InteractiveMapView. Set
+    /// when a search result / favorite is picked, or the recenter button
+    /// is tapped. A map long-press deliberately does NOT set it, so the
+    /// camera holds still while the rider drops pins around.
+    @State private var focusRequest: MapFocusRequest?
+    /// Rider dismissed the post-arrival RideStatsPanel via its close
+    /// button. It covers a lot of the map on smaller phones, so this is a
+    /// transient per-instance override on top of the `startedAt` gate —
+    /// cleared the moment the next leg starts folding again (see the
+    /// `status.rideStats.state` onChange below), so the summary comes
+    /// back for the NEXT arrival instead of staying hidden all ride.
+    @State private var rideStatsDismissed = false
+    /// Whether the "center on me" button should be shown — reported by
+    /// the map when the user puck drifts out of the central region.
+    @State private var showRecenterButton = false
+
+    /// Height of the browsing map area, measured at runtime. Feeds the
+    /// ceiling for the quick-access "Others" list so it can grow to the
+    /// bottom of the screen instead of a hard-coded strip.
+    @State private var browsingAreaHeight: CGFloat = 0
+    /// When set, the next destination picked in DestinationSearchSheet
+    /// is committed straight into this quick-access slot instead of
+    /// going through the preview/route flow.
+    @State private var slotToFill: QuickAccessSlot?
+
+    // feat/route-waypoints planning state
+    /// True when the search sheet result should be ADDED to the active
+    /// plan as a via-stop, rather than starting a fresh plan.
+    @State private var addingStopToPlan = false
+    /// Coordinate from a long-press, pending the add/destination dialog.
+    @State private var longPressCoord: CLLocationCoordinate2D?
+    @State private var showLongPressDialog = false
+    @State private var showRoutePreferences = false
+    /// Stops (id + name) of the plan last saved via the planner's bookmark
+    /// button. The button shows "saved" only while the plan still has
+    /// exactly these stops — edit the plan, or let a "Pin …" get its
+    /// reverse-geocoded name, and it can be saved again (overwrites).
+    @State private var savedPlanStops: [String]?
+    /// Stops of a plan opened from Saved routes, as loaded — the baseline for
+    /// "Discard this plan?" (such a plan can't be saved from the planner).
+    @State private var libraryBaselineStops: [String]?
+    /// A save is in flight (reverse-geocoding the current location).
+    @State private var savingPlan = false
+    /// The built route awaiting a name in the "Save route" prompt.
+    @State private var planSave: PlanSaveDraft?
+    @State private var showPlanSaveAlert = false
+    /// Mid-ride "Edit route" sheet (NavigationHUD button).
+    @State private var showEditRoute = false
+    @State private var planSaveName = ""
+    @State private var showDiscardPlanDialog = false
+
+    private struct PlanSaveDraft {
+        let plan: PlannedRoute
+        let route: SavedRoute
+        /// `stopsSnapshot` when the route was built — a pin renamed while
+        /// the prompt is up must still re-arm the bookmark.
+        let stops: [String]
+    }
+
+    /// Another sheet/cover/dialog is up; SwiftUI would drop an alert
+    /// presented now (and the save with it).
+    private var anotherModalUp: Bool {
+        showSettings || showSavedRoutes || showRideHistory || prerenderActive
+            || showSearch || showFavoriteEditor || showRoutePreferences
+            || showLongPressDialog || showBikePicker || showDiscardPlanDialog
+            || showEditRoute
+    }
+
+    private static func stopsSnapshot(_ plan: PlannedRoute) -> [String] {
+        plan.waypoints.map { "\($0.id)|\($0.name)" }
+    }
+
+    /// Planner Cancel asks first only for a multi-stop plan that isn't
+    /// saved as-is; an A→B plan is one search away.
+    static func planHasUnsavedWork(stops: [String], saved: [String]?) -> Bool {
+        stops.count > 2 && stops != saved
+    }
+
+    private enum DisplayMode { case picking, navigating, freeRiding, transitioning }
+    private var mode: DisplayMode {
+        if transitioning { return .transitioning }
+        if status.activeNavigator.isNavigating { return .navigating }
+        if status.isFreeRiding { return .freeRiding }
+        return .picking
+    }
+
+    /// Whether the picking phase should show the multi-stop planning UI.
+    private var isPlanning: Bool { status.plannedRoute != nil }
+
+    /// Heading fed to the home-map puck cone, in degrees clockwise from
+    /// north. Prefer true heading; fall back to magnetic; nil (hide the
+    /// cone) when neither is valid (negative == uncalibrated/unknown).
+    private var puckHeading: CLLocationDirection? {
+        guard let h = status.locationService.lastHeading else { return nil }
+        if h.trueHeading >= 0 { return h.trueHeading }
+        if h.magneticHeading >= 0 { return h.magneticHeading }
+        return nil
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            StatusBanner(state: status.connectionState,
+                         ssid: status.bikeSsid,
+                         dashUnresponsive: status.bikeLink.dashUnresponsive)
+
+            ZStack {
+                switch mode {
+                case .picking:       pickingBody
+                case .navigating:    navigatingBody
+                case .freeRiding:    freeRidingBody
+                case .transitioning: transitioningBody
+                }
+
+                if case .error = status.bikeLink.state, let err = status.lastError {
+                    VStack {
+                        Spacer()
+                        Text(err)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.red)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(.regularMaterial)
+                            .clipShape(.rect(cornerRadius: 8))
+                            .padding(.bottom, 12)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            controlButton
+        }
+        .toolbar {
+            // The saved-routes shortcut only belongs in the idle browsing
+            // state ("where do I want to go?"). Once a route is being
+            // planned for navigation — or navigation is already running —
+            // it has no logical place in the top bar, so hide it there.
+            if mode == .picking && !isPlanning {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showSavedRoutes = true } label: {
+                        Image(systemName: "point.topleft.down.to.point.bottomright.curvepath")
+                    }
+                    .accessibilityLabel("Saved routes")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showRideHistory = true } label: {
+                        Image(systemName: "clock.arrow.circlepath")
+                    }
+                    .accessibilityLabel("Ride history")
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { showSettings = true } label: {
+                    Image(systemName: "gearshape")
+                }
+                .accessibilityLabel("Settings")
+            }
+        }
+        .sheet(isPresented: $showSettings) {
+            NavigationStack { StreamingView() }
+                .environment(status)
+        }
+        .sheet(isPresented: $showSavedRoutes) {
+            SavedRoutesListView()
+                .environment(status)
+                .environment(status.savedRoutesStore)
+        }
+        .sheet(isPresented: $showRideHistory) {
+            RideHistoryView()
+                .environment(status)
+        }
+        .fullScreenCover(isPresented: $prerenderActive) {
+            PrerenderProgressView(progress: prerenderProgress)
+        }
+        .sheet(isPresented: $showSearch, onDismiss: {
+            // Clear the one-shot routing flags. Both are set BEFORE the
+            // sheet opens and were previously cleared ONLY inside
+            // `handlePickedDestination` — i.e. only when the rider actually
+            // picked something. Swiping the sheet away left them armed, so
+            // the NEXT unrelated search (the plain search pill) was still
+            // routed as "add a stop to the current plan" / "fill a quick
+            // slot". Picking a destination then silently inserted a via-
+            // point instead of creating a new destination, changing
+            // `plan.waypoints.count` — which both drives the Stops List's
+            // row count AND, at the `editableListThreshold` boundary,
+            // swaps the whole list out for the summary view. A row-count
+            // change plus a view-identity change in the same update is the
+            // "Invalid Number Of Items In Section" shape reported from
+            // TestFlight on 1.0.3 ("odejít z možnosti trasy a vytvořit
+            // nový cíl").
+            addingStopToPlan = false
+            slotToFill = nil
+            sharedSearchSeed = nil
+        }) {
+            DestinationSearchSheet(onPick: { dest in
+                handlePickedDestination(dest)
+            }, initialQuery: sharedSearchSeed)
+            .environment(status)
+            .environment(status.navigationStore)
+        }
+        .sheet(isPresented: $showFavoriteEditor) {
+            FavoriteEditorSheet(seed: favoriteEditorSeed)
+                .environment(status.navigationStore)
+        }
+        .sheet(isPresented: $showRoutePreferences, onDismiss: {
+            // Preferences (avoid highways/tolls) changed → every leg
+            // must be recomputed against the new constraints.
+            if let plan = status.plannedRoute {
+                Task { await status.recomputeDirtyLegs(plan.allLegIndices, in: plan) }
+            }
+        }) {
+            NavigationStack {
+                RoutePreferencesView()
+                    .environment(status.navigationStore)
+            }
+        }
+        // Only presented while the planner is still up with nothing else
+        // on screen; otherwise the save commits without a prompt.
+        .alert("Save route", isPresented: $showPlanSaveAlert, presenting: planSave) { draft in
+            TextField("Route name", text: $planSaveName)
+            Button("Cancel", role: .cancel) { planSave = nil }
+            Button("Save") {
+                status.commitPlanSave(draft.route, named: planSaveName, for: draft.plan)
+                savedPlanStops = draft.stops
+                planSave = nil
+            }
+            .keyboardShortcut(.defaultAction)
+        } message: { _ in
+            Text("Leave blank for an automatic name.")
+        }
+        .confirmationDialog("Add to route", isPresented: $showLongPressDialog, titleVisibility: .visible) {
+            Button("Add as stop") { commitLongPress(asDestination: false) }
+            Button("Set as destination") { commitLongPress(asDestination: true) }
+            Button("Cancel", role: .cancel) { longPressCoord = nil }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            // Diagnostic: record every scene-phase transition. Field
+            // evidence (8/2026): a locked-phone ride disconnected mid-
+            // navigation with NOTHING in the connection log explaining why
+            // (no wifi-path-down, no heartbeat failure) and the staged
+            // route was gone afterward — consistent with iOS jetsam-
+            // killing the app under CPU/memory pressure (locked-screen
+            // CGContext composition + VideoToolbox encoding every frame is
+            // real background load) and the rider re-launching cold. The
+            // connection log alone can't distinguish that from a plain
+            // Wi-Fi drop; this line is the missing half of the picture —
+            // if a future report shows `.background` immediately followed
+            // by a fresh cold-start "Joining Tripper AP" with NO
+            // intervening `.active`, that confirms a kill/relaunch rather
+            // than a network blip.
+            switch newPhase {
+            case .background, .inactive:
+                if !status.isStreaming, !status.activeNavigator.isNavigating, let token = locationToken {
+                    status.locationService.stop(token: token)
+                    locationToken = nil
+                }
+            case .active:
+                if mode == .picking, locationToken == nil {
+                    locationToken = status.locationService.start(mode: .mapping)
+                }
+            @unknown default:
+                break
+            }
+        }
+        .onChange(of: status.bikeLink.state) { _, newState in
+            handleLinkStateForAutoStart(newState)
+        }
+        .onChange(of: status.rideStats.state) { _, newState in
+            // A new leg started folding again (begin() after a paused
+            // post-arrival freeze) — clear a prior manual dismissal so
+            // the summary panel is back on screen for the NEXT arrival,
+            // rather than staying hidden for the rest of the ride. Safe
+            // to flip while navigating: RideStatsPanel only mounts in
+            // `.picking` mode, so this has no visible effect until the
+            // rider is back on the picker.
+            if newState == .running { rideStatsDismissed = false }
+        }
+        .onChange(of: status.plannedRoute?.isComputed) { _, _ in
+            // The plan just finished (re)computing. If the rider armed
+            // auto-start and we're already connected, this is the trigger
+            // that was waiting on the route — fire it now.
+            tryAutoStartNavigation()
+        }
+        .onChange(of: isPlanning) { _, planning in
+            // Rider tore down the plan (cleared destination) while waiting
+            // to connect → cancel the armed auto-start so a later manual
+            // connect doesn't unexpectedly launch into nothing.
+            if !planning { pendingAutoStart = false }
+        }
+        .onChange(of: status.plannedRoute.map(ObjectIdentifier.init), initial: true) { _, _ in
+            // "Discard this plan?" asked about the plan that is gone or was
+            // just replaced (e.g. by a share) — never let it discard the new
+            // one, nor a dropped write-back leave `anotherModalUp` stuck.
+            showDiscardPlanDialog = false
+            if let plan = status.plannedRoute, plan.isFromLibrary {
+                libraryBaselineStops = Self.stopsSnapshot(plan)
+            }
+        }
+        .onChange(of: showPlanSaveAlert) { _, up in
+            // Auto-start held while the rider names the route (below) —
+            // fire it once the prompt is answered.
+            if !up { tryAutoStartNavigation() }
+        }
+        .onChange(of: showDiscardPlanDialog) { _, up in
+            // "Keep editing" → resume a held auto-start ("Discard" disarms it).
+            if !up { tryAutoStartNavigation() }
+        }
+        .onChange(of: status.requestDismissSavedRoutes) { _, request in
+            // A saved route was staged for navigation from inside the
+            // Saved Routes sheet — tear the sheet down so the picker's
+            // planning UI (the staged plan) is visible. One-shot: reset.
+            if request {
+                showSavedRoutes = false
+                status.requestDismissSavedRoutes = false
+            }
+        }
+        .onChange(of: status.pendingSearchHint) { _, _ in consumePendingShare() }
+        .onChange(of: status.pendingShare) { _, _ in consumePendingShare() }
+        .onChange(of: [shareGateOpen, isPlanning], initial: true) { _, _ in
+            // Let a just-dismissed sheet finish animating out first, or the
+            // Search sheet presented on top of it is dropped too. Also
+            // re-checks when a plan is discarded or started (parked replay).
+            guard shareGateOpen else { return }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(600))
+                consumePendingShare()
+            }
+        }
+    }
+
+    /// Search can only be presented from the idle picker with nothing else
+    /// on screen — SwiftUI drops a sheet presented over another modal.
+    private var shareGateOpen: Bool {
+        mode == .picking && !anotherModalUp && !showPlanSaveAlert
+    }
+
+    /// Replay a share parked during a ride, or open Search pre-filled with a
+    /// label "Share to TripperDash++" couldn't geocode. Consumed only once
+    /// the gate is open; otherwise it stays pending for the gate onChange.
+    private func consumePendingShare() {
+        guard shareGateOpen else { return }
+        // A share parked during an earlier ride must not replace a plan the
+        // rider is building now; it waits until that plan is gone.
+        if !isPlanning, let share = status.pendingShare {
+            status.pendingShare = nil
+            Task { await status.beginPlanningFromShared(share, replay: true) }
+        } else if let hint = status.pendingSearchHint, !hint.isEmpty {
+            sharedSearchSeed = hint
+            showSearch = true
+            status.pendingSearchHint = nil
+        }
+    }
+
+    /// Reacts to link-state transitions for the auto-start feature.
+    private func handleLinkStateForAutoStart(_ newState: BikeLink.LinkState) {
+        switch newState {
+        case .connected:
+            tryAutoStartNavigation()
+        case .idle, .error:
+            // Connect failed or the rider cancelled → drop the intent so it
+            // can't silently fire on a future connect.
+            pendingAutoStart = false
+        case .connecting, .handshaking, .reconnecting:
+            break
+        }
+    }
+
+    /// Fires the armed auto-start iff every precondition holds. Safe to
+    /// call from multiple triggers (link reached `.connected`, or the plan
+    /// finished computing) — it's idempotent via the `pendingAutoStart`
+    /// flag, which it clears before starting.
+    ///
+    /// Intentionally inert for:
+    ///   - mid-ride reconnects: `mode` is `.navigating`, not `.picking`;
+    ///   - idle connects with no plan: `pendingAutoStart` was never armed
+    ///     (the no-plan "Connect to dash" path doesn't set it);
+    ///   - connects where the route isn't computed yet: we wait for the
+    ///     plan-computed trigger to call us again.
+    private func tryAutoStartNavigation() {
+        guard pendingAutoStart else { return }
+        guard status.bikeLink.state == .connected else { return }
+        // Not under the Save route prompt: the prerender cover can't be
+        // presented over it, and the ride shouldn't start mid-typing. If
+        // SwiftUI dropped that alert (flag stuck true), this holds auto-start
+        // until the next bookmark tap resets it; "Start navigation" still works.
+        // Same for "Discard this plan?": don't launch the plan being discarded.
+        guard !showPlanSaveAlert, !showDiscardPlanDialog else { return }
+        guard mode == .picking,
+              let plan = status.plannedRoute,
+              plan.isComputed else { return }
+        pendingAutoStart = false
+        startNavigation(plan: plan)
+    }
+
+    // MARK: - Phase bodies
+
+    @ViewBuilder
+    private var pickingBody: some View {
+        if isPlanning, let plan = status.plannedRoute {
+            planningBody(plan: plan)
+        } else {
+            browsingBody
+        }
+    }
+
+    /// The pre-plan map: live interactive map + search + quick access.
+    @ViewBuilder
+    private var browsingBody: some View {
+        ZStack(alignment: .top) {
+            InteractiveMapView(
+                userCoordinate: status.locationService.lastFix?.coordinate,
+                selectedPin: selectedDestination?.coordinate,
+                focusRequest: focusRequest,
+                userHeading: puckHeading,
+                onTap: { coord in
+                    // Long-pressing the map (re)selects a raw pin at that
+                    // point. The camera deliberately stays put — no
+                    // focusRequest — so the rider can nudge to a
+                    // neighbouring point while the card is up. Reverse-
+                    // geocode in the background to upgrade the "Pin x, y"
+                    // name to a real address.
+                    selectRawPin(at: coord)
+                },
+                onRecenterVisibilityChange: { visible in
+                    showRecenterButton = visible
+                }
+            )
+            .ignoresSafeArea(edges: .horizontal)
+            .onAppear {
+                if locationToken == nil {
+                    locationToken = status.locationService.start(mode: .mapping)
+                }
+            }
+            .onDisappear {
+                if let token = locationToken {
+                    status.locationService.stop(token: token)
+                    locationToken = nil
+                }
+            }
+
+            VStack(spacing: 10) {
+                searchPill
+                QuickAccessTiles(
+                    onPick: { fav in
+                        // Favorite tap: select it AND recenter the camera
+                        // on it (an explicit focus request).
+                        selectFavorite(fav)
+                    },
+                    onFillSlot: { slot in
+                        slotToFill = slot
+                        showSearch = true
+                    },
+                    maxListHeight: quickAccessListMaxHeight
+                )
+                .environment(status.navigationStore)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                .padding(.horizontal, 10)
+            }
+            .padding(.top, 6)
+
+            // Recenter FAB (bottom-right) + the compact preview card
+            // (bottom, full-width) share the bottom overlay region.
+            VStack(spacing: 10) {
+                Spacer()
+                if showRecenterButton {
+                    HStack {
+                        Spacer()
+                        recenterButton
+                            .padding(.trailing, 14)
+                    }
+                }
+                // Post-arrival ride summary. Shown ONLY back on the picker
+                // once a ride has actually happened (`startedAt != nil`) and
+                // we're not selecting a new destination. It stays frozen on
+                // the last totals until the session ends (link fully down →
+                // RideStatsService.reset() zeroes `startedAt` and it vanishes)
+                // or a new route resumes folding. Hidden while a destination
+                // card is up so the two don't fight for the bottom region.
+                // Also hidden if the rider dismissed it via its close button
+                // (`rideStatsDismissed`, cleared on the next leg's onChange
+                // below) — it covers a lot of the map on smaller phones and
+                // must be closeable without waiting out the whole session.
+                if status.rideStats.stats.startedAt != nil, selectedDestination == nil, !rideStatsDismissed {
+                    RideStatsPanel(onClose: {
+                        rideStatsDismissed = true
+                        // Drop the on-disk copy too, so closing the summary
+                        // means it won't re-appear on the next app launch.
+                        status.rideStats.acknowledgeSummary()
+                    })
+                        .padding(.horizontal, 10)
+                }
+                if let dest = selectedDestination {
+                    DestinationPreviewCard(
+                        destination: dest,
+                        onCalculateRoutes: { d in
+                            selectedDestination = nil
+                            status.beginPlanning(to: d)
+                        },
+                        onAddToFavorites: { d in
+                            favoriteEditorSeed = d
+                            showFavoriteEditor = true
+                        },
+                        onClose: {
+                            selectedDestination = nil
+                        }
+                    )
+                    .environment(status.navigationStore)
+                }
+            }
+            .padding(.bottom, 8)
+            .animation(.easeInOut(duration: 0.2), value: selectedDestination)
+            .animation(.easeInOut(duration: 0.2), value: showRecenterButton)
+            .animation(.easeInOut(duration: 0.2), value: status.rideStats.stats.startedAt)
+            .animation(.easeInOut(duration: 0.2), value: rideStatsDismissed)
+        }
+        // Measure the whole browsing area — deliberately the ZStack and not
+        // the quick-access overlay itself, whose height is what the
+        // measurement feeds, so measuring it would be circular and could
+        // oscillate. This is stable: it tracks the screen/safe area, not the
+        // panel's content.
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.height
+        } action: { height in
+            browsingAreaHeight = height
+        }
+    }
+
+    /// Height handed to `QuickAccessTiles` for its expanded favorites list,
+    /// which now always opens to fill it (the List scrolls internally once
+    /// the rows overflow).
+    ///
+    /// Budgeted from the measured browsing area minus the chrome sitting
+    /// above the list — search pill, the two pinned tiles, the disclosure
+    /// header and the paddings between them — plus a bottom margin so the
+    /// panel stops short of the very bottom edge rather than running under
+    /// the home indicator.
+    ///
+    /// Since the list takes this value verbatim, an over-estimate here is
+    /// the one that shows: it would push the panel past the bottom of the
+    /// screen. The constants are therefore chosen to err on the generous
+    /// side for the chrome. `QuickAccessTiles` applies its own floor, so an
+    /// under-estimate (or the negative value on the first layout pass,
+    /// before the geometry is measured) can't collapse the list.
+    private var quickAccessListMaxHeight: CGFloat {
+        let chromeAboveList: CGFloat = 200
+        let bottomMargin: CGFloat = 28
+        return browsingAreaHeight - chromeAboveList - bottomMargin
+    }
+
+    /// Round "center on me" button, bottom-right. Issues an explicit
+    /// focus request to the current GPS fix (the only thing that ever
+    /// re-frames the user after the one-shot initial center).
+    private var recenterButton: some View {
+        Button {
+            if let c = status.locationService.lastFix?.coordinate {
+                focusRequest = MapFocusRequest(coordinate: c)
+            }
+        } label: {
+            Image(systemName: "location.fill")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 44, height: 44)
+                .background(.regularMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(.separator, lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Center on my location")
+    }
+
+    // MARK: - Home-map selection helpers
+
+    /// Select a raw tapped point. Holds the pin synchronously, then
+    /// reverse-geocodes in the background to give it a real name/address.
+    private func selectRawPin(at coord: CLLocationCoordinate2D) {
+        let dest = Destination.fromTap(coord)
+        selectedDestination = dest
+        Task { await upgradeTapName(dest.id, coord) }
+    }
+
+    /// Select a favorite and recenter the camera on it.
+    private func selectFavorite(_ fav: Favorite) {
+        selectedDestination = fav.asDestination
+        focusRequest = MapFocusRequest(coordinate: fav.coordinate)
+    }
+
+    /// Best-effort reverse geocode for a tapped pin. Updates the live
+    /// selection in place iff it's still the same pin. Silent on failure
+    /// (the "Pin lat, lon" fallback stays).
+    ///
+    /// `@MainActor` because it mutates `selectedDestination` (`@State`)
+    /// after the `await`; the geocoder suspension still frees the main
+    /// thread while the network round-trip is in flight.
+    @MainActor
+    private func upgradeTapName(_ id: UUID, _ coord: CLLocationCoordinate2D) async {
+        let geocoder = CLGeocoder()
+        let loc = CLLocation(latitude: coord.latitude, longitude: coord.longitude)
+        guard let placemark = try? await geocoder.reverseGeocodeLocation(loc).first else { return }
+        let name = placemark.name ?? placemark.thoroughfare ?? "Dropped pin"
+        let addr = [placemark.thoroughfare, placemark.locality].compactMap { $0 }.joined(separator: ", ")
+        // Only apply if the selection is still this exact pin (the rider
+        // may have tapped elsewhere or cleared the card meanwhile).
+        guard selectedDestination?.id == id else { return }
+        selectedDestination = Destination(id: id,
+                                          name: name,
+                                          addressLine: addr.isEmpty ? nil : addr,
+                                          coordinate: coord)
+    }
+
+    /// The multi-stop planning UI: PlanningMapView (top) + waypoint list
+    /// (bottom). Lives in .picking with the stream off.
+    ///
+    /// The waypoint list is hidden for a large plan (a track staged for
+    /// navigation carries up to `navigableCap` via-points, plus manual
+    /// plans could in theory grow past the threshold): the map already
+    /// shows start→finish and the list would be an un-scrollable wall of
+    /// pass-through points. Below the threshold the editable Stops list
+    /// shows as before.
+    @ViewBuilder
+    private func planningBody(plan: PlannedRoute) -> some View {
+        let showStops = plan.waypoints.count <= RoutePoint.editableListThreshold && !plan.isTrack
+        VStack(spacing: 0) {
+            PlanningMapView(
+                plan: plan,
+                onPickAlternative: { legIndex, optionIndex in
+                    plan.setSelectedOption(legIndex: legIndex, optionIndex: optionIndex)
+                },
+                onAddWaypoint: { coord in
+                    longPressCoord = coord
+                    showLongPressDialog = true
+                }
+            )
+            .frame(maxHeight: .infinity)
+            .overlay(alignment: .top) { planningBanner }
+
+            if showStops {
+                Divider()
+
+                WaypointListView(
+                    plan: plan,
+                    onRecompute: { dirty in
+                        Task { await status.recomputeDirtyLegs(dirty, in: plan) }
+                    },
+                    onAddStop: {
+                        addingStopToPlan = true
+                        showSearch = true
+                    },
+                    recomputingLegs: status.recomputingLegs
+                )
+                .frame(maxHeight: 260)
+            } else {
+                Divider()
+                largePlanSummary(plan: plan)
+            }
+        }
+        .confirmationDialog("Discard this plan?", isPresented: $showDiscardPlanDialog,
+                            titleVisibility: .visible) {
+            Button("Discard", role: .destructive) {
+                pendingAutoStart = false
+                status.cancelPlanning()
+            }
+            Button("Keep editing", role: .cancel) {}
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("Cancel") {
+                    // A library plan is compared with its stops as loaded: it
+                    // can't be saved from here, but edits made for this ride can
+                    // still be lost.
+                    let baseline = plan.isFromLibrary ? libraryBaselineStops : savedPlanStops
+                    if Self.planHasUnsavedWork(stops: Self.stopsSnapshot(plan), saved: baseline) {
+                        showDiscardPlanDialog = true
+                    } else {
+                        status.cancelPlanning()
+                    }
+                }
+            }
+            if !plan.isFromLibrary {
+                let saved = savedPlanStops == Self.stopsSnapshot(plan)
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        savingPlan = true
+                        Task {
+                            if let draft = await status.draftPlanSave() {
+                                let stops = Self.stopsSnapshot(draft.plan)
+                                if anotherModalUp || transitioning || showPlanSaveAlert
+                                    || status.plannedRoute !== draft.plan {
+                                    // Start tapped (the prerender cover is
+                                    // ~500 ms away and an alert would block
+                                    // it) / planning cancelled / another
+                                    // screen opened during the geocode: no
+                                    // prompt, save under the suggested name
+                                    // (rename in the library). A flag still
+                                    // `true` here can only mean an earlier
+                                    // alert was dropped mid-transition (a live
+                                    // one is modal) — reset it so the next
+                                    // save can prompt again.
+                                    status.commitPlanSave(draft.route, named: draft.suggestedName, for: draft.plan)
+                                    savedPlanStops = stops
+                                    showPlanSaveAlert = false
+                                } else {
+                                    planSave = PlanSaveDraft(plan: draft.plan, route: draft.route, stops: stops)
+                                    planSaveName = draft.suggestedName
+                                    showPlanSaveAlert = true
+                                }
+                            }
+                            savingPlan = false
+                        }
+                    } label: {
+                        Image(systemName: saved ? "bookmark.fill" : "bookmark")
+                    }
+                    .disabled(saved || savingPlan)
+                    .accessibilityLabel(saved ? "Route saved to Saved routes"
+                                              : "Save route to Saved routes")
+                }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showRoutePreferences = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                }
+                .accessibilityLabel("Route preferences")
+            }
+        }
+    }
+
+    /// Compact start→finish summary shown in place of the Stops list for a
+    /// large / track plan. Start + end labels + total distance/time; the
+    /// actual "Start navigation" CTA lives in the bottom control bar as
+    /// usual (connect-first). No per-stop editing.
+    @ViewBuilder
+    private func largePlanSummary(plan: PlannedRoute) -> some View {
+        let origin = plan.waypoints.first
+        let dest = plan.waypoints.last
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "location.fill").foregroundStyle(.green).frame(width: 18)
+                Text(origin?.name ?? "Start").lineLimit(1)
+            }
+            HStack(spacing: 10) {
+                Image(systemName: "flag.checkered").foregroundStyle(.red).frame(width: 18)
+                Text(dest?.name ?? "Destination").lineLimit(1)
+            }
+            Divider()
+            HStack {
+                Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                    .foregroundStyle(.blue)
+                Text("\(plan.waypoints.count - 1) via-points")
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if plan.isComputed {
+                    Text("\(plan.totalDistanceDisplay) · \(plan.totalTravelTimeDisplay)")
+                        .font(.subheadline.weight(.medium))
+                }
+            }
+            .font(.footnote)
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxHeight: 260)
+    }
+
+    @ViewBuilder
+    private var planningBanner: some View {
+        if !status.recomputingLegs.isEmpty {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Calculating routes…").font(.footnote)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(.regularMaterial, in: Capsule())
+            .padding(.top, 8)
+        } else if let err = status.planError {
+            Label(err, systemImage: "exclamationmark.triangle.fill")
+                .font(.footnote)
+                .foregroundStyle(.red)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(.regularMaterial, in: Capsule())
+                .padding(.top, 8)
+        }
+    }
+
+    private var searchPill: some View {
+        Button { showSearch = true } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                Text("Where to?").foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.regularMaterial, in: Capsule())
+            .padding(.horizontal, 10)
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var navigatingBody: some View {
+        // Scrolls so an over-tall HUD (demo preview + multi-stop pills + Edit
+        // route) can't push the Stop button and status banner off-screen.
+        // minHeight keeps the HUD panel filling the space when it fits.
+        GeometryReader { geo in
+        ScrollView {
+        VStack(spacing: 0) {
+            // Demo mode: the interactive map is unmounted while streaming, so
+            // the on-screen dash preview is the only place the rider sees the
+            // projected map + the dash's own turn card and ETA. Show it above the HUD.
+            if status.bikeLink.isDemo && status.isStreaming {
+                DashPreviewPanel(demoModel: status.demoDashModel)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+            }
+            NavigationHUD(
+                isReconnecting: status.bikeLink.state == .reconnecting,
+                dashUnresponsive: status.bikeLink.dashUnresponsive,
+                imperial: status.dashNavSettings.units == .imperial,
+                useCommaDecimal: status.dashNavSettings.decimalSeparator == .comma,
+                is24Hour: status.dashNavSettings.is24Hour,
+                onEditRoute: { showEditRoute = true }
+            )
+            .environment(status.activeNavigator)
+            .sheet(isPresented: $showEditRoute) {
+                EditRouteSheet()
+                    .environment(status)
+            }
+            // Stop / exit-nav unmount the HUD with the sheet; a flag left
+            // true would keep `anotherModalUp` stuck.
+            .onDisappear { showEditRoute = false }
+            .onAppear {
+                forwardFixesToNavigator()
+            }
+            .onChange(of: status.activeNavigator.hasArrived) { _, arrived in
+                guard arrived else { return }
+                showEditRoute = false   // an edit to a finished ride is moot
+                // Rider confirmed: auto-dismiss the arrival card after a
+                // few seconds (both hands busy on the bike).
+                arrivalTask?.cancel()
+                arrivalTask = Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(4))
+                    guard !Task.isCancelled else { return }
+                    arrivalTask = nil
+                    await finishArrival()
+                }
+            }
+        }
+        .frame(minHeight: geo.size.height, alignment: .top)
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        }
+    }
+
+    @ViewBuilder
+    private var transitioningBody: some View {
+        VStack(spacing: 16) {
+            ProgressView().controlSize(.large)
+            Text(status.activeNavigator.isNavigating ? "Starting navigation…" : "Stopping navigation…")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Free-ride phase: the live map is projecting to the dash with no
+    /// route. The interactive map is intentionally NOT mounted here (the
+    /// streamed MapViewSource owns the render pool while streaming, same
+    /// rule as `.navigating`), so we show the same status page as
+    /// navigation — `FreeRideHUD` — with the maneuver/ETA slots swapped
+    /// for a "Free ride" card + Duration/Distance + a position-only map.
+    ///
+    /// No save affordance here: like navigation, "Save ride" lives only on
+    /// the post-ride "Trip" card (`RideStatsPanel`) once the ride has ENDED
+    /// (surfaced in `browsingBody` after `stopFreeRide()`).
+    @ViewBuilder
+    private var freeRidingBody: some View {
+        GeometryReader { geo in   // same overflow guard as navigatingBody
+        ScrollView {
+        VStack(spacing: 0) {
+            if status.bikeLink.isDemo && status.isStreaming {
+                DashPreviewPanel(demoModel: status.demoDashModel)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+            }
+            FreeRideHUD(
+                stats: status.rideStats.stats,
+                imperial: status.dashNavSettings.units == .imperial,
+                useCommaDecimal: status.dashNavSettings.decimalSeparator == .comma,
+                position: status.locationService.lastFix?.coordinate
+            )
+            .padding(.horizontal, 12)
+        }
+        .frame(minHeight: geo.size.height, alignment: .top)
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        }
+    }
+
+    // MARK: - Control button
+
+    @ViewBuilder
+    private var controlButton: some View {
+        switch (mode, status.bikeLink.state) {
+        case (.transitioning, _):
+            HStack { ProgressView(); Text("Switching…") }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(Color.gray.opacity(0.15))
+
+        // Hold-to-stop: a gloved or mount-bumped tap must not end the ride
+        // (no undo — re-plan, new MKDirections, new prerender).
+        case (.navigating, _):
+            HoldToConfirmButton(title: "Hold to stop navigation", spokenTitle: "Stop navigation",
+                                systemImage: "stop.circle.fill") { stopNavigation() }
+
+        case (.freeRiding, _):
+            HoldToConfirmButton(title: "Hold to stop free ride", spokenTitle: "Stop free ride",
+                                systemImage: "stop.circle.fill") { status.stopFreeRide() }
+
+        // Connection-in-progress takes precedence over the planning UI:
+        // a rider who tapped "Connect to dash" from the plan screen must
+        // still see progress + Cancel.
+        case (.picking, .connecting), (.picking, .handshaking):
+            connectingControl
+
+        case (.picking, .reconnecting):
+            reconnectingControl
+
+        // Connect-first: the real "Start navigation" CTA only appears once
+        // the dash is connected. Planning without a link falls through to
+        // `connectControl` below — you must connect before you can start.
+        case (.picking, .connected) where isPlanning:
+            startPlanButton
+
+        case (.picking, .connected):
+            connectedIdleControl
+
+        case (.picking, .idle), (.picking, .error):
+            connectControl
+        }
+    }
+
+    /// "Connect to dash" CTA — shown while idle/errored. When a plan is
+    /// already laid out, tapping this arms `pendingAutoStart`: the rider
+    /// has signalled intent to ride, so navigation auto-starts the moment
+    /// the link reaches `.connected` (no second tap on "Start").
+    /// CTA label — reflects demo mode (no dash to connect to) vs the real
+    /// connect flow, and whether a plan is already laid out.
+    private var connectLabel: String {
+        if status.bikeLink.demoMode {
+            return isPlanning ? "Connect (demo) & start navigation" : "Connect (demo)"
+        }
+        let bikes = status.savedBikes.bikes
+        if bikes.isEmpty {
+            return "Add your bike"
+        }
+        if bikes.count == 1 {
+            return isPlanning ? "Connect & start navigation" : "Connect to \(bikes[0].displayName)"
+        }
+        // Multiple bikes → the tap opens a chooser.
+        return isPlanning ? "Choose bike & start navigation" : "Connect to bike…"
+    }
+
+    /// Arm auto-start (when a plan is laid out) and kick off the connect
+    /// flow for a specific bike. Shared by the single-bike tap and the
+    /// multi-bike picker.
+    private func beginConnect(to bike: SavedBike) {
+        if isPlanning { pendingAutoStart = true }
+        status.connect(to: bike)
+    }
+
+    @ViewBuilder
+    private var connectControl: some View {
+        Button {
+            let bikes = status.savedBikes.bikes
+            if status.bikeLink.demoMode {
+                // Demo: no bike to pick, fake the link directly.
+                if isPlanning { pendingAutoStart = true }
+                status.bikeLink.connect()
+            } else if bikes.isEmpty {
+                // Nothing saved yet — send the rider to the garage.
+                showSettings = true
+            } else if bikes.count == 1 {
+                beginConnect(to: bikes[0])
+            } else {
+                // More than one bike → let the rider choose.
+                showBikePicker = true
+            }
+        } label: {
+            Label(connectLabel,
+                  systemImage: status.bikeLink.demoMode
+                      ? "play.rectangle.on.rectangle"
+                      : "antenna.radiowaves.left.and.right")
+                .frame(maxWidth: .infinity).padding()
+                .background(Color.accentColor.opacity(0.15))
+        }
+        .buttonStyle(.plain)
+        .confirmationDialog("Connect to which bike?",
+                            isPresented: $showBikePicker,
+                            titleVisibility: .visible) {
+            ForEach(status.savedBikes.bikes) { bike in
+                Button(bike.displayName) { beginConnect(to: bike) }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+    }
+
+    /// Connecting / handshaking progress + Cancel. When auto-start is
+    /// armed the caption says so, so the rider knows navigation will kick
+    /// off by itself the moment the handshake completes.
+    @ViewBuilder
+    private var connectingControl: some View {
+        let base = status.bikeLink.isWaitingForWifi
+            ? "Waiting for Wi-Fi…"
+            : (status.bikeLink.state == .connecting ? "Connecting…" : "Handshaking…")
+        VStack(spacing: 8) {
+            HStack {
+                ProgressView()
+                Text(pendingAutoStart ? "\(base) navigation will start automatically" : base)
+            }
+            .frame(maxWidth: .infinity).padding()
+            .background(Color.orange.opacity(0.15))
+
+            Button(role: .destructive) {
+                pendingAutoStart = false
+                status.bikeLink.disconnect()
+            } label: {
+                Text("Cancel")
+                    .frame(maxWidth: .infinity).padding(.vertical, 8)
+            }
+        }
+    }
+
+    /// Auto-reconnect progress + Cancel (idle drop, not mid-navigation).
+    @ViewBuilder
+    private var reconnectingControl: some View {
+        VStack(spacing: 8) {
+            HStack {
+                ProgressView()
+                // Distinguish "can't reach the dash" from "the dash is there
+                // but its K1G server stopped answering" — the second needs an
+                // ignition cycle, and retrying will never fix it on its own.
+                Text(status.bikeLink.dashUnresponsive
+                     ? "Dash not responding — try the ignition"
+                     : "Reconnecting to dash…")
+            }
+            .frame(maxWidth: .infinity).padding()
+            .background(Color.yellow.opacity(0.15))
+
+            Button(role: .destructive) { status.bikeLink.disconnect() } label: {
+                Text("Cancel")
+                    .frame(maxWidth: .infinity).padding(.vertical, 8)
+            }
+        }
+    }
+
+    /// Connected but idle (no plan yet) — prompt to pick + Start free
+    /// ride + Disconnect. "Start free ride" projects the map to the dash
+    /// without any route (no destination, no navigation), for a rider who
+    /// just wants the moving map on the bike.
+    @ViewBuilder
+    private var connectedIdleControl: some View {
+        VStack(spacing: 6) {
+            Text("Dash connected — pick a destination above")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .background(Color.green.opacity(0.12))
+
+            Button {
+                Task { @MainActor in await status.startFreeRide() }
+            } label: {
+                Label("Start free ride (map only)", systemImage: "map.fill")
+                    .frame(maxWidth: .infinity).padding(.vertical, 10)
+                    .background(Color.accentColor.opacity(0.15))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .buttonStyle(.plain)
+
+            Button(role: .destructive) { status.bikeLink.disconnect() } label: {
+                Text("Disconnect")
+                    .frame(maxWidth: .infinity).padding(.vertical, 8)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var startPlanButton: some View {
+        let plan = status.plannedRoute
+        let ready = plan?.isComputed ?? false
+        Button {
+            if let plan, ready { startNavigation(plan: plan) }
+        } label: {
+            Label(ready ? "Start navigation" : "Calculating route…",
+                  systemImage: ready ? "play.circle.fill" : "hourglass")
+                .frame(maxWidth: .infinity).padding()
+                .background((ready ? Color.red : Color.gray).opacity(0.15))
+        }
+        .buttonStyle(.plain)
+        .disabled(!ready)
+    }
+
+    // MARK: - Destination pick routing
+
+    /// Route a destination picked in the search sheet to the right
+    /// place: a quick-access slot, an add-to-plan, or a fresh preview.
+    private func handlePickedDestination(_ dest: Destination) {
+        if let slot = slotToFill {
+            status.navigationStore.setQuickAccess(slot, from: dest)
+            slotToFill = nil
+            return
+        }
+        if addingStopToPlan, let plan = status.plannedRoute {
+            addingStopToPlan = false
+            let wp = Waypoint.from(destination: dest)
+            let dirty = plan.insertBeforeDestination(wp)
+            Task { await status.recomputeDirtyLegs(dirty, in: plan) }
+            return
+        }
+        // Default: select on the home map (pin + compact card) and
+        // recenter the camera on the picked point.
+        selectedDestination = dest
+        focusRequest = MapFocusRequest(coordinate: dest.coordinate)
+    }
+
+    /// Commit a long-pressed coordinate as either a via-stop or the new
+    /// destination of the active plan.
+    private func commitLongPress(asDestination: Bool) {
+        guard let coord = longPressCoord, let plan = status.plannedRoute else {
+            longPressCoord = nil
+            return
+        }
+        longPressCoord = nil
+        let wp = Waypoint(name: String(format: "Pin %.4f, %.4f", coord.latitude, coord.longitude),
+                          addressLine: nil,
+                          coordinate: coord)
+        let dirty: Set<Int>
+        if asDestination {
+            dirty = plan.appendWaypoint(wp)
+        } else {
+            dirty = plan.insertBeforeDestination(wp)
+        }
+        Task {
+            await reverseGeocodeAndName(wp.id, coord, in: plan)
+            await status.recomputeDirtyLegs(dirty, in: plan)
+        }
+    }
+
+    /// Best-effort reverse geocode to give a long-pressed pin a real
+    /// name. Failure is silent — the "Pin lat, lon" fallback stays.
+    private func reverseGeocodeAndName(_ id: UUID, _ coord: CLLocationCoordinate2D, in plan: PlannedRoute) async {
+        let geocoder = CLGeocoder()
+        let loc = CLLocation(latitude: coord.latitude, longitude: coord.longitude)
+        if let placemark = try? await geocoder.reverseGeocodeLocation(loc).first {
+            let name = placemark.name ?? placemark.thoroughfare ?? "Stop"
+            let addr = [placemark.thoroughfare, placemark.locality].compactMap { $0 }.joined(separator: ", ")
+            plan.renameWaypoint(id: id, name: name, addressLine: addr.isEmpty ? nil : addr)
+        }
+    }
+
+    // MARK: - Navigation transitions
+
+    /// Synchronous part of route install: attach polyline + route to the
+    /// renderer and kick off best-effort corridor prefetches (cameras,
+    /// limits). Does NOT bake tiles — that's `prerenderRouteTiles`, run in
+    /// the background so the dash link is never blocked on OSM downloads.
+    private func installRouteGeometrySync(_ route: MKRoute) {
+        status.mapViewSource.setRoutePolyline(route.polyline)
+        // Bake in the renderer's current palette. `currentStyle` is set by
+        // the Auto resolver / manual picker before navigation starts (see
+        // AppStatus), so the ride opens in the right Light/Dark style.
+        status.mapViewSource.setCurrentRoute(route)
+        // Prefetch speed cameras along the new route corridor (best-effort,
+        // disk-cached, gated on the Notifications → Speed cameras toggle).
+        // Fire-and-forget: navigation must never wait on Overpass.
+        status.prefetchSpeedCameras(for: route)
+        // Prefetch OSM speed-limit ways along the same corridor (best-
+        // effort, disk-cached, gated on the Speed limit display mode).
+        status.prefetchSpeedLimits(for: route)
+    }
+
+    /// Bake the fast-start tile window for `route` and install it in the
+    /// renderer. Runs in the background AFTER streaming has started, so a
+    /// stalled tile fetch (no connectivity) can't delay the dash projection.
+    ///
+    /// The (still-empty) cache is installed IMMEDIATELY, before the corridor
+    /// bake even starts — not after it finishes. `MapViewSource`'s render
+    /// path already has an "off-corridor rescue tile" fallback
+    /// (`ensurePositionFallback`) for whenever `nearestTile` can't find a
+    /// covering corridor tile; an empty cache trips that same path from
+    /// frame one, so it bakes ONE tile centred on the rider's current GPS
+    /// fix and the dash shows a real map under the route line within ~1-2 s
+    /// instead of the flat vector-only fallback for the whole ~5-15 s the
+    /// full corridor bake takes. Once the corridor bake's first batch
+    /// lands, `nearestTile` starts hitting real tiles and the renderer
+    /// switches over from the rescue tile to the proper route corridor
+    /// automatically — no extra state needed on this side. (Field
+    /// request, 8/2026: "map looks broken/blank right when navigation
+    /// starts, until tiles catch up" — this was the gap.)
+    ///
+    /// `buildLayers: false` on this EARLY install, though: `setTileCache`'s
+    /// side effect of kicking off the coarse (z=13, 7x7=49 tiles) + fine
+    /// (z=16, 49 tiles) sibling bakes was, when this was written, real
+    /// MainActor CGContext work (`RouteTileCache.composite` now stitches
+    /// off the main actor, and `setTileCache` now only kicks off fine —
+    /// coarse is baked lazily on zoom-out — but a second bake still
+    /// competes for the network and the CPU at startup). Firing that at t=0 stacked THREE
+    /// concurrent MainActor-heavy bakes (base corridor, coarse, fine)
+    /// right on top of the Wi-Fi handshake / RTP stream startup that's
+    /// racing at the exact same moment — field-confirmed regression
+    /// (8/2026, day after the rescue-tile fix shipped): "grey background"
+    /// on the dash on the first attempt, an outright connection **timeout**
+    /// on the second. Deferring `buildLayers` to fire only after the full
+    /// corridor bake completes (a second `setTileCache` call, same timing
+    /// this had before the rescue-tile change) keeps the instant rescue
+    /// tile while no longer contending with the handshake for the main
+    /// actor.
+    private func prerenderRouteTiles(_ route: MKRoute) async {
+        // A reroute / alternative switch can land before or during this
+        // 8 km bake; its own (shorter, later-started) bake then owns the
+        // renderer, and installing this cache would put the OLD route's
+        // tiles back under the rider.
+        guard status.mapViewSource.isCurrentRoute(route) else { return }
+        let cache = RouteTileCache(style: status.mapViewSource.currentStyle)
+        status.mapViewSource.setTileCache(cache, buildLayers: false)
+        prerenderProgress = 0
+        prerenderActive = true
+        await cache.prerender(route: route) { p in
+            prerenderProgress = p
+        }
+        // Re-install now that the corridor bake is done: same cache
+        // object (no visual change), but this time kicks off the
+        // fine sibling layer (coarse bakes on zoom-out) — safe now that the handshake/
+        // stream-start race is long over.
+        prerenderActive = false
+        // A Light/Dark switch mid-bake already started its own re-bake in
+        // the new palette; installing this one would mix palettes.
+        guard status.mapViewSource.isCurrentRoute(route),
+              cache.style == status.mapViewSource.currentStyle else { return }
+        status.mapViewSource.setTileCache(cache, buildLayers: true)
+    }
+
+    /// Concatenate every leg's selected-option polyline into one full-trip
+    /// coordinate array and collect the intermediate via-stops, then push
+    /// both into the renderer so the dash draws the whole route + a dot at
+    /// each stop. Origin (index 0) and final destination (last) are
+    /// excluded from the dots — the puck marks the origin and the line's
+    /// end marks the destination. A single-destination plan (n=2) yields
+    /// no dots, so this is a no-op visual-wise beyond the full line (which
+    /// equals the single leg anyway).
+    private func installFullRouteContext(plan: PlannedRoute) {
+        var full: [CLLocationCoordinate2D] = []
+        for leg in plan.legs {
+            guard let route = leg.selected?.route else { continue }
+            let poly = route.polyline
+            let n = poly.pointCount
+            let pts = poly.points()
+            for i in 0..<n {
+                let c = pts[i].coordinate
+                // Skip a duplicate join point between consecutive legs
+                // (leg i ends where leg i+1 begins).
+                if let last = full.last,
+                   last.latitude == c.latitude, last.longitude == c.longitude {
+                    continue
+                }
+                full.append(c)
+            }
+        }
+        // Intermediate via-stops only (drop origin + final destination).
+        let wps = plan.waypoints
+        let dots: [CLLocationCoordinate2D]
+        if wps.count > 2 {
+            dots = wps[1..<(wps.count - 1)].map { $0.coordinate }
+        } else {
+            dots = []
+        }
+        status.mapViewSource.setFullRoute(coords: full, waypoints: dots)
+    }
+
+    /// Wire the shared route-changed hook (covers initial bake, reroute,
+    /// AND multi-stop leg advance — all funnel through here).
+    private func installRouteChangedHook() {
+        // Dash "exit navigation" button (0x12) → same teardown as holding
+        // "Stop navigation" in the app. Registered alongside the route-changed hook so
+        // it shares the session's lifecycle; cleared in stopNavigation().
+        status.activeNavigator.onExitNavRequested = { [weak status] in
+            guard status != nil else { return }
+            self.stopNavigation()
+        }
+        status.activeNavigator.onActiveRouteChanged = { [weak status] newRoute in
+            guard let status else { return }
+            // (1) Polyline first — pure CPU CGContext path, BG/lock safe.
+            status.mapViewSource.setRoutePolyline(newRoute.polyline)
+            // (2) Tile re-bake — also BG/lock safe since the OSM migration
+            //     (URLSession + CGContext, no MKMapSnapshotter/Metal), so
+            //     it fires immediately even with the phone pocketed.
+            status.mapViewSource.scheduleTileCacheRebuild(for: newRoute)
+            // (3) Refresh the FULL trip geometry + via-dots. A leg-advance
+            //     or an auto-switch onto an alternative changes which leg
+            //     option is selected, so the whole-route line must be
+            //     rebuilt from the (mutated) plan — otherwise the dash
+            //     keeps drawing the pre-switch shape.
+            if let plan = status.activeNavigator.plan {
+                self.installFullRouteContext(plan: plan)
+            }
+            // (4) Cameras + average-speed sections for a new road or the
+            //     next leg. No-op while the route stays inside the area
+            //     already fetched for this ride (incl. right after start).
+            status.prefetchSpeedCameras(for: newRoute, extending: true)
+            // (5) Same for the speed-limit ways: without it a new road never
+            //     got its limits, and neither did the rest of a ride whose
+            //     start fetch timed out.
+            status.prefetchSpeedLimits(for: newRoute, extending: true)
+        }
+        // F3: whenever the navigator's alternatives change (leg swap,
+        // auto-switch, reroute, clear) rebuild the render models and push
+        // them into the dash — thin grey lines + ETA-delta bubbles.
+        status.activeNavigator.onAlternativesChanged = { [weak status] alts in
+            guard status != nil else { return }
+            self.pushAlternativeRenders(alts)
+        }
+    }
+
+    /// Convert the navigator's alternative `MKRoute`s into dash render
+    /// models (coords + ETA delta vs the active route + a bubble anchor)
+    /// and push them into MapViewSource. The active route's travel time
+    /// comes from the navigator's current leg selection.
+    private func pushAlternativeRenders(_ alts: [MKRoute]) {
+        let activeRoute = status.activeNavigator.activeRoute
+        let activeTime = activeRoute?.expectedTravelTime ?? 0
+        let activeCoords = activeRoute?.polyline.coordinateList() ?? []
+        let renders: [AlternativeRouteRender] = alts.compactMap { route in
+            let coords = route.polyline.coordinateList()
+            // Only surface an alternative that has a DRAWABLE line. The
+            // renderer skips a polyline with < 2 points (the alt-line pass in
+            // `drawProjectedTile` guards `coords.count > 1`), but the ETA bubble is drawn from a
+            // separate `bubbleAnchor` that's always valid — so a degenerate
+            // alt (empty / single-point polyline, which MapKit occasionally
+            // returns near a fork/roundabout) produced an ORPHAN "−2 min"
+            // bubble floating with no grey line under it (field report,
+            // roundabout, 8/2026). Drop such alts entirely: no line, no bubble.
+            guard coords.count > 1 else { return nil }
+            // Also drop a NEAR-DUPLICATE alt: MapKit near a roundabout often
+            // returns an "alternative" that is geometrically almost identical
+            // to the active route (it just retimes the same road). Its grey
+            // line renders directly under the blue one and is invisible, but
+            // the ETA bubble still floats — a phantom "+3 min" with no
+            // distinct route shown (field report, roundabout 50.3559,14.4549,
+            // 8/2026). Require the alt to diverge from the active line by at
+            // least `altMinDivergenceMeters` at its farthest point; otherwise
+            // it isn't a real fork worth labelling.
+            if !activeCoords.isEmpty,
+               Self.maxDivergence(of: coords, from: activeCoords) < Self.altMinDivergenceMeters {
+                return nil
+            }
+            // Anchor the ETA bubble at the FORK — the last point the alt
+            // shares with the active route before it peels off. That's where
+            // the rider has to decide, and where the grey line visibly
+            // leaves the blue one. The old vertex midpoint usually fell on
+            // a stretch the alt SHARES with the active route (grey hidden
+            // under blue), so the bubble floated on the blue line with no
+            // alternative in sight (field report, 9/2026). Farthest-point
+            // anchoring was rejected too: on a long detour that point can be
+            // kilometres past the turn, off the ~1 km-wide dash view.
+            let anchor = activeCoords.isEmpty
+                ? coords[coords.count / 2]
+                : coords[Self.forkIndex(of: coords, from: activeCoords)]
+            return AlternativeRouteRender(
+                id: UUID(),
+                coords: coords,
+                etaDeltaSeconds: route.expectedTravelTime - activeTime,
+                bubbleAnchor: anchor
+            )
+        }
+        status.mapViewSource.setAlternativeRoutes(renders)
+    }
+
+    /// Minimum distance (metres) an alternative must diverge from the active
+    /// route at its farthest point to count as a distinct fork. Below this
+    /// the two lines overlap on screen, so a grey line + ETA bubble would be
+    /// a phantom label with no visibly separate route. One lane-plus of GPS
+    /// clearance keeps genuine short forks while dropping retimed duplicates.
+    static let altMinDivergenceMeters: CLLocationDistance = 25
+
+    /// Largest distance from any vertex of `coords` to the polyline
+    /// `reference`. A cheap "how far apart are these two lines at their most
+    /// separated" measure — enough to tell a real fork from a near-duplicate.
+    ///
+    /// Distance is to the reference's SEGMENTS, not its vertices: MapKit
+    /// polylines are sparse on straight roads (a motorway can have one
+    /// vertex every ~2 km), so a vertex-only scan made a mere retiming of
+    /// the SAME road look ~1 km off — it passed the fork filter, drew its
+    /// grey line exactly under the blue one (invisible) and left a
+    /// "similar" / "+4 min" bubble with no route under it (field report,
+    /// 9/2026).
+    static func maxDivergence(of coords: [CLLocationCoordinate2D],
+                              from reference: [CLLocationCoordinate2D]) -> CLLocationDistance {
+        guard reference.count > 1 else { return .greatestFiniteMagnitude }
+        var worst: CLLocationDistance = 0
+        // Sample up to ~40 vertices so a dense polyline stays cheap.
+        let stride = max(1, coords.count / 40)
+        var i = 0
+        while i < coords.count {
+            worst = max(worst, distance(from: coords[i], toPolyline: reference))
+            i += stride
+        }
+        return worst
+    }
+
+    /// Index of the fork: the last vertex of `coords` still on `reference`
+    /// (within `altMinDivergenceMeters`) before the first one that leaves
+    /// it. Scans vertex by vertex from the start — no sampling, the fork
+    /// must be exact — and stops at the first departure, so the cost is
+    /// only the shared stretch. Falls back to the midpoint if the alt never
+    /// leaves (not reachable once `maxDivergence` has passed the filter).
+    static func forkIndex(of coords: [CLLocationCoordinate2D],
+                          from reference: [CLLocationCoordinate2D]) -> Int {
+        guard reference.count > 1 else { return coords.count / 2 }
+        for i in coords.indices
+        where distance(from: coords[i], toPolyline: reference) >= altMinDivergenceMeters {
+            return max(0, i - 1)
+        }
+        return coords.count / 2
+    }
+
+    /// Metres from `p` to the nearest segment of `polyline`.
+    static func distance(from p: CLLocationCoordinate2D,
+                         toPolyline polyline: [CLLocationCoordinate2D]) -> CLLocationDistance {
+        var nearest = CLLocationDistance.greatestFiniteMagnitude
+        for j in 0..<(polyline.count - 1) {
+            nearest = min(nearest, distance(from: p, toSegment: polyline[j], polyline[j + 1]))
+        }
+        return nearest
+    }
+
+    /// Metres from `p` to the segment `a`–`b`, on a local equirectangular
+    /// plane centred at `p` (exact enough at the tens-of-km scale of one
+    /// route segment, and far cheaper than geodesic cross-track maths).
+    static func distance(from p: CLLocationCoordinate2D,
+                         toSegment a: CLLocationCoordinate2D,
+                         _ b: CLLocationCoordinate2D) -> CLLocationDistance {
+        let mPerDegLat = 111_320.0
+        let mPerDegLon = 111_320.0 * cos(p.latitude * .pi / 180)
+        let ax = (a.longitude - p.longitude) * mPerDegLon, ay = (a.latitude - p.latitude) * mPerDegLat
+        let bx = (b.longitude - p.longitude) * mPerDegLon, by = (b.latitude - p.latitude) * mPerDegLat
+        let dx = bx - ax, dy = by - ay
+        let len2 = dx * dx + dy * dy
+        // Projection of the origin (p) onto the segment, clamped to [a, b].
+        let t = len2 > 0 ? max(0, min(1, -(ax * dx + ay * dy) / len2)) : 0
+        let cx = ax + t * dx, cy = ay + t * dy
+        return (cx * cx + cy * cy).squareRoot()
+    }
+
+    /// Start navigation from a multi-stop plan. Bakes the first leg's
+    /// selected option; subsequent legs re-bake via the changed hook.
+    private func startNavigation(plan: PlannedRoute) {
+        guard plan.isComputed, let firstLeg = plan.legs.first?.selected?.route else { return }
+        // Connect-first invariant: navigation is projection onto the dash,
+        // so starting it with no link is meaningless. The UI only shows
+        // "Start navigation" while `.connected`, but guard here too in case
+        // the link dropped in the gap between render and tap.
+        guard status.bikeLink.state == .connected else {
+            status.bikeLink.connect()
+            return
+        }
+        arrivalTask?.cancel()
+        arrivalTask = nil
+        transitioning = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(500))
+            // The rider chose this plan over a share parked during an
+            // earlier ride — don't replay a stale destination after it.
+            status.pendingShare = nil
+            installRouteChangedHook()
+            // Resolve Light/Dark/Auto for the current position+time before
+            // the first bake, so the ride opens in the right palette.
+            status.primeMapStyleForStart()
+            // Attach the route polyline + full trip context and kick off the
+            // tile prerender, but DO NOT await the prerender here. The dash
+            // link must not be held hostage to OSM tile downloads: in a spot
+            // with no connectivity (e.g. an underground car park) each tile
+            // fetch waits for a network (`waitsForConnectivity`) up to its
+            // 16 s resource timeout, and is retried twice — ~50 s per tile,
+            // 4 tiles at a time, so a whole prerender can take many minutes.
+            // (Routing requests are capped separately: a reroute gives up
+            // after `ActiveNavigator.routeRequestTimeout`, 12 s, and retries
+            // 10 s later.) If `startStreaming()` sat behind that, the dash never gets
+            // its projection-on + RTP stream and times out on its side
+            // ("timeout" on the bike — field report 2026-08). So: install
+            // geometry synchronously, start streaming immediately (the
+            // renderer draws the vector fallback — route line on a coloured
+            // background — until tiles arrive), and let the prerender fill in
+            // the real map in the background when connectivity returns.
+            installRouteGeometrySync(firstLeg)
+            installFullRouteContext(plan: plan)
+            await status.activeNavigator.start(plan: plan)
+            // Planning UI is consumed — drop it so picking returns to
+            // browsing after navigation ends.
+            status.plannedRoute = nil
+            if !status.isStreaming {
+                await status.startStreaming()
+            }
+            transitioning = false
+            // Fire-and-forget the tile prerender AFTER the stream is live.
+            // If it stalls on connectivity the ride still works (vector
+            // fallback); when tiles land, `setTileCache` swaps in the real
+            // map mid-ride.
+            Task { @MainActor in await prerenderRouteTiles(firstLeg) }
+        }
+    }
+
+    /// Legacy single-route entry point removed: navigation now always
+    /// starts from a PlannedRoute (the n=2 case covers a single
+    /// destination). Reroute does not go through here — it's wired via
+    /// `AppStatus.activeNavigator.onRerouteRequested`.
+
+    private func stopNavigation() {
+        arrivalTask?.cancel()
+        arrivalTask = nil
+        // The corridor bake may still be running; its cover must not
+        // outlive the ride (e.g. stopped from the dash button).
+        prerenderActive = false
+        status.activeNavigator.stop()
+        status.activeNavigator.onActiveRouteChanged = nil
+        status.activeNavigator.onExitNavRequested = nil
+        if status.isStreaming {
+            status.stopStreaming()
+        }
+        // Drop the tile cache + polyline so the next route gets a fresh build.
+        status.mapViewSource.setTileCache(nil)
+        status.mapViewSource.setCurrentRoute(nil)   // late bakes must not install after stop
+        status.mapViewSource.setRoutePolyline(nil)
+        status.mapViewSource.setFullRoute(coords: [], waypoints: [])
+        status.mapViewSource.setAlternativeRoutes([])
+        status.plannedRoute = nil
+        selectedDestination = nil
+        transitioning = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(500))
+            transitioning = false
+        }
+    }
+
+    /// Finalize an arrival. The stream stayed UP through the "You've arrived"
+    /// card (AppStatus.onArrived no longer tears it down), so here we swap the
+    /// live map from navigation to free-ride IN PLACE — the dash never blinks
+    /// out of projection. `stop()` clears `isNavigating` (so `mode` leaves
+    /// `.navigating` and the running ActiveNavLoop drops into its no-maneuver
+    /// free-ride heartbeat); `transitionToFreeRideInPlace()` swaps the tile
+    /// cache + route geometry without restarting the RTP stream.
+    private func finishArrival() async {
+        status.activeNavigator.stop()
+        // Late bakes must not install the finished route, on every branch
+        // below (the link-down one used to keep it current).
+        status.mapViewSource.setCurrentRoute(nil)
+        status.activeNavigator.onActiveRouteChanged = nil
+        status.plannedRoute = nil
+        selectedDestination = nil
+        // Keep the live map up by transitioning the RUNNING stream into
+        // free-ride (no teardown/restart → no display blink). Show a centred
+        // "You've arrived" notice on the dash for a few seconds. Guarded on the
+        // link still being up and a stream actually running.
+        if status.bikeLink.state == .connected, status.isStreaming {
+            status.transitionToFreeRideInPlace()
+            status.mapViewSource.showNotice(
+                DashNotice(text: "You've arrived", level: .info, duration: 5)
+            )
+            return
+        }
+        // Link dropped at arrival (no live stream to reuse): fall back to a
+        // fresh free-ride start if still connected, else just slide back.
+        if status.bikeLink.state == .connected, !status.isStreaming {
+            await status.startFreeRide()
+            status.mapViewSource.showNotice(
+                DashNotice(text: "You've arrived", level: .info, duration: 5)
+            )
+            return
+        }
+        transitioning = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(500))
+            transitioning = false
+        }
+    }
+
+    /// Forward LocationService updates into ActiveNavigator while
+    /// navigation is active.
+    private func forwardFixesToNavigator() {
+        Task { @MainActor in
+            withObservationTracking {
+                _ = status.locationService.lastFix
+            } onChange: {
+                Task { @MainActor in
+                    if let fix = status.locationService.lastFix {
+                        status.navigatorIngest(fix)
+                    }
+                    if status.activeNavigator.isNavigating {
+                        forwardFixesToNavigator()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Hold to confirm
+
+/// Bottom-bar destructive control that fires only after a continuous
+/// press of `holdDuration`; a fill sweeps leading→trailing while held and
+/// drops back on early release. VoiceOver double-tap acts directly.
+private struct HoldToConfirmButton: View {
+    let title: String
+    /// VoiceOver label: a double-tap acts directly, so no "Hold to".
+    let spokenTitle: String
+    let systemImage: String
+    let action: () -> Void
+
+    static let holdDuration: Double = 1
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var progress: CGFloat = 0
+
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .frame(maxWidth: .infinity).padding()
+            .background {
+                ZStack {
+                    Color.red.opacity(0.15)
+                    Color.red.opacity(0.45)
+                        .scaleEffect(x: progress, y: 1, anchor: .leading)
+                }
+            }
+            .contentShape(Rectangle())
+            // perform fires once per press, so holding past 1 s can't
+            // re-trigger. Generous maximumDistance: a gloved finger drifts.
+            .onLongPressGesture(minimumDuration: Self.holdDuration, maximumDistance: 40) {
+                action()
+            } onPressingChanged: { pressing in
+                let anim: Animation? = pressing ? .linear(duration: Self.holdDuration)
+                    : (reduceMotion ? nil : .easeOut(duration: 0.15))
+                withAnimation(anim) { progress = pressing ? 1 : 0 }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(spokenTitle)
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { action() }
+    }
+}
+
+// MARK: - Status banner
+
+private struct StatusBanner: View {
+    let state: BikeConnectionState
+    let ssid: String?
+    /// See `BikeLink.dashUnresponsive`. Passed in rather than read from the
+    /// environment because this banner is driven by `BikeConnectionState`,
+    /// which deliberately collapses the link's sub-states and so cannot
+    /// express "reconnecting, but the dash is the thing that's broken".
+    var dashUnresponsive: Bool = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle().fill(color).frame(width: 10, height: 10)
+            Text(label).font(.subheadline.weight(.medium))
+            Spacer()
+            if let ssid {
+                Text(ssid).font(.caption.monospaced()).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.thinMaterial)
+    }
+
+    private var color: Color {
+        switch state {
+        case .disconnected: .gray
+        case .wifiJoining:  .yellow
+        case .handshaking:  .orange
+        case .reconnecting: .yellow
+        case .connected:    .blue
+        case .streaming:    .green
+        case .error:        .red
+        }
+    }
+
+    private var label: String {
+        switch state {
+        case .disconnected: "Not connected"
+        case .wifiJoining:  "Join the Tripper Wi-Fi…"
+        case .handshaking:  "Handshaking with dash…"
+        case .reconnecting:
+            dashUnresponsive
+                ? "Dash not responding — try the ignition"
+                : "Reconnecting to dash…"
+        case .connected:    "Connected — idle"
+        case .streaming:    "Streaming"
+        case .error:        "Connection failed"
+        }
+    }
+}
+
+#Preview {
+    NavigationStack { MapPickerView() }
+        .environment(AppStatus())
+}

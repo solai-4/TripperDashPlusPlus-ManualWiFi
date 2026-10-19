@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- NOTE                                                          -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!--
+	  This file is the *additional* Info.plist; Xcode generates the
+	  baseline one (CFBundleIdentifier, CFBundleVersion, …) because
+	  GENERATE_INFOPLIST_FILE = YES. Add only keys that aren't covered
+	  by the build settings.
+	-->
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- Background execution (Phase 6 will use these for real)        -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<string>audio</string>
+	</array>
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- Live Activities (Lock Screen + Dynamic Island ride card)      -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+
+	<!-- Enables ActivityKit. The ride Live Activity is started/updated/ended
+	     from LiveActivityController and rendered by the TripperDashWidgets
+	     extension. ActivityKit is free (no paid-only entitlement). -->
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- Privacy strings (required by the App Store / iOS prompts)    -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>TripperDash++ needs your location to show the bike position on the Tripper display.</string>
+
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>TripperDash++ continues streaming navigation to the Tripper display even when the phone screen is off.</string>
+
+	<!-- Required by iOS 14+ for direct IP / Bonjour traffic on the LAN.
+	     The Tripper AP lives at 192.168.1.1 over UDP. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>TripperDash++ needs to talk to the Royal Enfield Tripper dash over Wi-Fi (192.168.1.1).</string>
+
+	<!-- Required by iOS to control the system music player: the dash's
+	     now-playing screen sends prev/next-track joystick events that
+	     TripperDash++ forwards to Apple Music via
+	     MPMusicPlayerController.systemMusicPlayer (see DashMediaControl). -->
+	<key>NSAppleMusicUsageDescription</key>
+	<string>TripperDash++ uses the dash joystick to skip to the next or previous song in your music.</string>
+
+	<!-- No Bonjour service types: the dash is reached by fixed IP, not
+	     discovery. Harmless placeholder; plain unicast UDP triggers the
+	     local-network prompt without it. -->
+	<key>NSBonjourServices</key>
+	<array/>
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- Export compliance                                            -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+
+	<!-- The only crypto we use is the RSA/PKCS1 handshake to the bike's
+	     dash (CryptoKit / Security), which is standard, exempt encryption.
+	     Declaring `false` lets every TestFlight / App Store upload skip
+	     the manual export-compliance question and process automatically. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- App Transport Security                                       -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+
+	<!-- Allow plain UDP to 192.168.1.1 (the bike has no DNS / no TLS). -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- Device requirements                                           -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+		<string>wifi</string>
+	</array>
+
+	<!-- Phone-only, portrait — the Tripper UI is steered from a thumb on
+	     the bars, not by rotating the device. -->
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- Build provenance                                              -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+
+	<!--
+	  Short git commit SHA the binary was built from. This placeholder is
+	  overwritten at build time by the `stamp-git-sha.sh` Run Script phase
+	  (PlistBuddy writes into the built Info.plist). Surfaced in
+	  Settings → Build → Version as "1.0 (46ab7a9)". A trailing "*" means
+	  the working tree had uncommitted changes at build time.
+	-->
+	<key>GitCommitSHA</key>
+	<string>dev</string>
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- Custom URL scheme — "Share to TripperDash++" handoff          -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+
+	<!--
+	  The share extension resolves a shared Google/Apple Maps payload and
+	  posts a `tripperdash://plan?wp=…` (or `tripperdash://search?q=…`) deep
+	  link, which the OS routes to the main app's onOpenURL. Registering the
+	  scheme here is what makes the app the target of that open.
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>eu.kolaczek.TripperDashPP.deeplink</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>tripperdash</string>
+			</array>
+		</dict>
+	</array>
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- Launch screen: dark backdrop + centred app logo. iOS 13+ uses  -->
+	<!-- the UILaunchScreen dictionary instead of a storyboard/xib.      -->
+	<!-- Required for App Store submission and to opt into full native   -->
+	<!-- screen resolution (no letterboxing).                            -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string>LaunchBackground</string>
+		<key>UIImageName</key>
+		<string>LaunchLogo</string>
+		<key>UIImageRespectsSafeAreaInsets</key>
+		<true/>
+	</dict>
+
+	<!-- ───────────────────────────────────────────────────────────── -->
+	<!-- Logging: persist info level for the app's own subsystem       -->
+	<!-- ───────────────────────────────────────────────────────────── -->
+
+	<!-- Info-level lines ("Baked batch", "Speed-limit grid", heartbeat,
+	     reroutes) otherwise live only in a memory ring buffer and roll out
+	     during a long ride before Settings → Export log reads them.
+	     Debug (per-tile fetch spam) stays off. See os_log(5). -->
+	<key>OSLogPreferences</key>
+	<dict>
+		<key>eu.kolaczek.tripperdashpp</key>
+		<dict>
+			<key>DEFAULT-OPTIONS</key>
+			<dict>
+				<key>Level</key>
+				<dict>
+					<key>Enable</key>
+					<string>Info</string>
+					<key>Persist</key>
+					<string>Info</string>
+				</dict>
+			</dict>
+		</dict>
+	</dict>
+
+</dict>
+</plist>

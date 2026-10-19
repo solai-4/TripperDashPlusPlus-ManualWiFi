@@ -1,0 +1,300 @@
+//
+//  RideStatsService.swift
+//  TripperDashPP
+//
+//  Live half of the GPS trip computer. A @MainActor @Observable service
+//  that folds the shared LocationService fix stream into a running
+//  RideStats and owns the ride lifecycle.
+//
+//  No second CLLocationManager — it subscribes to the same fix stream the
+//  map, nav, and telemetry already share (LocationService.subscribeFixes),
+//  so there's no authorization race and no extra battery draw. The pure
+//  math lives in RideStats; this type is just wiring.
+//
+//  Session lifetime (rider-confirmed model):
+//    • Totals accumulate across back-to-back rides — arriving and then
+//      planning a fresh route KEEPS folding onto the same numbers, so a
+//      multi-leg day reads as one ride.
+//    • Totals are held frozen on screen once streaming stops (`end()`)
+//      until the rider streams again (a new route) or the session ends.
+//      Arrival keeps the stream up (free ride), so totals keep folding.
+//    • The LIVE accumulator is in-memory. To survive the stop→sleep→
+//      kill cycle (iOS suspends and then terminates the app once the
+//      streaming wakelock drops), the LAST ride summary is
+//      persisted to UserDefaults at each teardown (`end()`/`pause()`) and
+//      restored on launch, so reopening the app shows the last ride's
+//      summary panel instead of a blank picker. The restored ride is
+//      STALE, not a continuation: the first `begin()` of a genuinely new
+//      ride zeroes it (see `restoredFromDisk`).
+//    • reset() zeroes mid-session AND clears the persisted copy; AppStatus
+//      calls it when the bike link goes fully down (user disconnect, or
+//      auto-reconnect gives up after the reconnect budget = motorcycle off).
+//
+//  Why persist at teardown plus a checkpoint every `checkpointEveryFixes`
+//  accepted fixes (not per-fix): a long ride's `trackPoints` is thousands
+//  of points, so writing it on every 1 Hz fix would be wasteful. The
+//  checkpoint (~5 min) is for the ride history — arrival no longer tears
+//  the stream down, so a whole outing is often ONE leg, and a swipe-kill
+//  or jetsam mid-ride would otherwise lose all of it. A kill now loses at
+//  most the last ~5 minutes. The checkpoint encodes and writes on the
+//  serial `RideHistoryStore.io` queue without waiting (a long track is
+//  tens of ms of JSON — the render loop shares the main actor); teardowns
+//  wait on the same queue, so they're on disk before iOS can suspend the
+//  app and always land after any checkpoint still in flight.
+//
+
+import Foundation
+import os
+
+@MainActor
+@Observable
+final class RideStatsService {
+
+    private static let log = Logger(subsystem: "eu.kolaczek.tripperdashpp", category: "RideStats")
+
+    /// UserDefaults key holding the last ride's persisted `RideStats` (JSON).
+    private static let storageKey = "RideStats.lastRide.v1"
+
+    /// Mid-ride checkpoint cadence: accepted fixes (~1 Hz → ~5 min).
+    static let checkpointEveryFixes = 300
+
+    /// The live accumulator. Views read this; all math is in RideStats.
+    private(set) var stats = RideStats()
+
+    enum State: Equatable { case idle, running, paused }
+    private(set) var state: State = .idle
+
+    private weak var location: LocationService?
+    private var sub: LocationSubscription?
+    private let defaults: UserDefaults
+    /// Ride history (last 30 days). Gets every teardown snapshot; nil in
+    /// tests that only exercise the last-ride summary.
+    private let history: RideHistoryStore?
+
+    /// True when `stats` was rehydrated from disk on launch and no new ride
+    /// has begun yet. The restored ride is a FINISHED ride from a previous
+    /// app session shown for reference — the next `begin()` must zero it so a
+    /// new ride doesn't fold onto last time's totals. Cleared by `begin()`.
+    private var restoredFromDisk = false
+
+    init(location: LocationService, defaults: UserDefaults = .standard,
+         history: RideHistoryStore? = nil) {
+        self.location = location
+        self.defaults = defaults
+        self.history = history
+        restoreLastRide()
+    }
+
+    // MARK: - Lifecycle
+
+    /// Begin folding fixes into the accumulator. Called when streaming
+    /// starts. Idempotent — a second call while running is a no-op.
+    ///
+    /// Deliberately does NOT reset for an in-memory continuation: starting a
+    /// new route after an arrival WITHIN the same app session resumes onto
+    /// the existing totals (the held, frozen numbers), so a day of
+    /// back-to-back legs reads as one continuous ride.
+    ///
+    /// EXCEPTION: if the totals were rehydrated from disk on launch
+    /// (`restoredFromDisk`), they belong to a PREVIOUS app session and must
+    /// NOT be continued — zero them first so the new ride starts clean.
+    func begin() {
+        guard state != .running else { return }
+        if restoredFromDisk {
+            // The on-screen numbers are last session's ride, shown for
+            // reference. A genuinely new ride starts fresh.
+            stats = RideStats()
+            restoredFromDisk = false
+        }
+        state = .running
+        sub = location?.subscribeFixes { [weak self] fix in
+            // LocationService fires subscribers on the main actor (fresh
+            // fixes via `Task { @MainActor }`, replay synchronously from
+            // this @MainActor method), so assuming isolation is safe —
+            // same pattern as DeviceTelemetry's notification handlers.
+            MainActor.assumeIsolated { self?.ingest(fix) }
+        }
+    }
+
+    /// Keep totals but stop folding new fixes. Persists the frozen summary so
+    /// it survives an app kill (e.g. iOS terminating the backgrounded app).
+    func pause() {
+        guard state == .running else { return }
+        state = .paused
+        persistLastRide()
+    }
+
+    /// Resume folding after a pause.
+    func resume() {
+        guard state == .paused else { return }
+        state = .running
+    }
+
+    /// Zero the ride. Called when the session ends — the bike link goes
+    /// fully down (user disconnect, or auto-reconnect exhausts its budget
+    /// = motorcycle off). Drops any live subscription and returns to idle
+    /// so the post-arrival panel (gated on `stats.startedAt`) disappears.
+    /// Also clears the persisted copy — the session is over, so a relaunch
+    /// should NOT resurrect this ride's summary.
+    func reset() {
+        // The session-end path (link fully down) runs reset() before
+        // stopStreaming() → end(), so this is the last chance to keep the
+        // ride in history. A summary restored from disk was recorded in its
+        // own session — re-recording it would resurrect a ride the rider
+        // deleted from the history.
+        if !restoredFromDisk { history?.record(stats) }
+        sub = nil
+        stats = RideStats()
+        state = .idle
+        restoredFromDisk = false
+        removePersistedRide()
+    }
+
+    /// The rider dismissed the post-arrival summary panel (its close
+    /// button). Drop the persisted copy so a relaunch doesn't resurrect a
+    /// summary the rider has already seen and closed — without this the
+    /// on-disk record would re-hydrate and the panel would reappear on the
+    /// next launch. Only clears disk: the live in-memory `stats` stay (the
+    /// UI hides the panel via its own transient `rideStatsDismissed` flag),
+    /// so a back-to-back next leg still resumes onto the same totals within
+    /// this session. `restoredFromDisk` is left alone on purpose: a
+    /// summary restored from a PREVIOUS session must still be zeroed by the
+    /// next `begin()` — clearing it here folded today's ride onto
+    /// yesterday's (same `startedAt`, one merged history file).
+    func acknowledgeSummary() {
+        removePersistedRide()
+    }
+
+    /// Streaming stopped — drop the subscription, keep totals on screen.
+    /// The frozen numbers stay visible (via the post-arrival panel) until
+    /// the next ride resumes folding or reset() ends the session. Persists
+    /// the summary so it survives the stop→sleep→kill cycle: this runs at
+    /// the stream teardown, before iOS can terminate the backgrounded app.
+    func end() {
+        sub = nil
+        if state == .running { state = .paused }
+        persistLastRide()
+    }
+
+    // MARK: - Persistence
+
+    /// Write the current `stats` to disk as the "last ride" summary. Called
+    /// at each teardown (`end()`/`pause()`). Skips empty rides (no
+    /// `startedAt`) so a stop before any fix doesn't leave a blank record.
+    ///
+    /// `background: true` (mid-ride checkpoint) queues the encode + writes
+    /// on `RideHistoryStore.io` and returns at once; a teardown waits.
+    private func persistLastRide(background: Bool = false) {
+        guard stats.startedAt != nil else { return }
+        let snapshot = stats
+        // A restored summary was recorded in its own session; an `end()`
+        // before the next `begin()` (link drop mid-connect) must not write
+        // it back — the rider may have deleted it since.
+        let historyURL = restoredFromDisk ? nil : history?.accept(snapshot)
+        // UserDefaults is documented thread-safe but not marked Sendable.
+        nonisolated(unsafe) let defaults = self.defaults
+        let key = Self.storageKey, log = Self.log
+        let write: @Sendable () -> Void = {
+            do {
+                let data = try JSONEncoder().encode(snapshot)   // once, for both
+                defaults.set(data, forKey: key)
+                if let historyURL { try data.write(to: historyURL, options: .atomic) }
+            } catch {
+                log.error("Failed to persist last ride: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        if background {
+            RideHistoryStore.io.async(execute: write)
+        } else {
+            RideHistoryStore.io.sync(execute: write)
+        }
+    }
+
+    /// Drop the last-ride key — on `io`, after any checkpoint still queued,
+    /// so a late write can't bring it back.
+    private func removePersistedRide() {
+        // UserDefaults is documented thread-safe but not marked Sendable.
+        nonisolated(unsafe) let defaults = self.defaults
+        let key = Self.storageKey
+        let remove: @Sendable () -> Void = { defaults.removeObject(forKey: key) }
+        RideHistoryStore.io.sync(execute: remove)
+    }
+
+    /// Rehydrate the last ride's summary from disk on launch. The restored
+    /// ride is a finished, reference-only summary (`restoredFromDisk = true`,
+    /// state stays `.idle`) — the picker shows its RideStatsPanel, and the
+    /// next `begin()` zeroes it for a fresh ride.
+    private func restoreLastRide() {
+        guard let data = defaults.data(forKey: Self.storageKey) else { return }
+        do {
+            stats = try JSONDecoder().decode(RideStats.self, from: data)
+            restoredFromDisk = true
+            Self.log.info("Restored last ride summary from disk")
+        } catch {
+            Self.log.error("Failed to restore last ride: \(error.localizedDescription, privacy: .public) — clearing")
+            defaults.removeObject(forKey: Self.storageKey)
+        }
+    }
+
+    // MARK: - Fold
+
+    private func ingest(_ fix: Fix) {
+        guard state == .running else { return }
+        let before = stats.trackPoints.count
+        stats = stats.folding(fix)
+        let count = stats.trackPoints.count
+        if count != before, count % Self.checkpointEveryFixes == 0 { persistLastRide(background: true) }
+    }
+
+    // MARK: - Save ride to the route library
+
+    /// True when there is a recorded track worth saving. The UI gates the
+    /// "Save ride" affordance on this so an empty ride never creates a
+    /// route.
+    var hasRecordedTrack: Bool { !stats.trackPoints.isEmpty }
+
+    /// Build a `.track` `SavedRoute` from the recorded ride, ready to hand
+    /// to `SavedRoutesStore.add(_:)`. Returns `nil` when nothing was
+    /// recorded.
+    ///
+    /// The FULL, precise breadcrumb is stored verbatim in `points` — no
+    /// Douglas–Peucker reduction here (a 2-hour ride keeps its thousands of
+    /// points) so the preview map and GPX export reproduce the real ride
+    /// exactly. The reduction to ≤`RoutePoint.navigableCap` via-points is
+    /// applied transiently at navigation time (`beginPlanningFromSavedRoute`),
+    /// where MKDirections needs a sane number of legs. `totalDistanceMeters`
+    /// is measured along the full trace.
+    func makeSavedRoute(name: String? = nil, now: Date = Date()) -> SavedRoute? {
+        Self.savedRoute(from: stats, name: name, now: now)
+    }
+
+    /// Same as `makeSavedRoute`, for any ride (e.g. one from the history).
+    static func savedRoute(from stats: RideStats, name: String? = nil,
+                           now: Date = Date()) -> SavedRoute? {
+        let track = stats.trackPoints
+        guard !track.isEmpty else { return nil }
+
+        let points = track.map {
+            RoutePoint(latitude: $0.latitude, longitude: $0.longitude)
+        }
+        let fullDistance = GPXGeometry.pathLength(points.map(\.coordinate))
+
+        return SavedRoute(
+            name: name ?? Self.defaultRideName(start: stats.startedAt ?? now),
+            kind: .track,
+            points: points,
+            totalDistanceMeters: fullDistance,
+            sourceFilename: nil
+        )
+    }
+
+    /// A default, human-readable ride name derived from the start time,
+    /// e.g. "Ride 2026-07-27 09:41".
+    static func defaultRideName(start: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone.current
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return "Ride \(f.string(from: start))"
+    }
+}

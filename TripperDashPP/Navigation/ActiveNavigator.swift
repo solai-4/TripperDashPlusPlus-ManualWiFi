@@ -1,0 +1,1622 @@
+//
+//  ActiveNavigator.swift
+//  TripperDashPP
+//
+//  Phase 7f — owns the *active* navigation session. Subscribes to
+//  LocationService updates, computes on-route status, remaining
+//  distance, upcoming maneuver, and ETA. Phase 7h adds reroute
+//  hysteresis on top.
+//
+//  Lifecycle: start(plan:) → ingest(fix:) on each location update → stop().
+//  All published state goes through @Observable so the HUD reactively
+//  updates without timers in the view.
+//
+
+import CoreLocation
+import Foundation
+import MapKit
+import os
+import Observation
+
+@MainActor
+@Observable
+final class ActiveNavigator {
+
+    // MARK: - Published state
+
+    /// True once start(...) was called and we haven't stopped.
+    private(set) var isNavigating: Bool = false
+
+    /// True once we've reached the final destination. The HUD shows an
+    /// "arrived" confirmation; MapPickerView auto-dismisses after a few
+    /// seconds and swaps the still-running stream to free-ride in place.
+    private(set) var hasArrived: Bool = false
+
+    /// The route currently being followed (may be replaced on reroute).
+    private(set) var activeRoute: MKRoute?
+
+    /// The destination we set out for.
+    private(set) var destination: Destination?
+
+    /// Meters remaining to the destination along the current route.
+    private(set) var remainingDistance: CLLocationDistance = 0
+
+    /// Live ETA in seconds to the CURRENT LEG's destination. F6: pure
+    /// Apple estimate, no pace/ratio correction of any kind. COMPUTED,
+    /// not stored — reads `legArrivalDate` (an absolute wall-clock
+    /// arrival time seeded from `MKRoute.expectedTravelTime` at start/
+    /// reroute/leg-advance and refreshed every `etaRefreshInterval` by a
+    /// live MKDirections re-fetch from the rider's current position)
+    /// against `Date.now` on every access — so it "ticks down" purely
+    /// from wall clock elapsing between re-fetches, with zero local
+    /// correction math anywhere. `ActiveNavLoop`'s independent 1 Hz pump
+    /// reads this every second regardless of GPS fix cadence, so the
+    /// dash sees a smooth per-second countdown even if fixes are sparse.
+    /// Trade-off accepted deliberately: if the rider is stopped for
+    /// longer than `etaRefreshInterval`, the countdown can run down past
+    /// the true remaining time before the next re-fetch corrects it back
+    /// up — bounded drift, not a bug (Martin, 7/2026: wanted the simplest
+    /// possible model, no home-grown correction to compensate for this).
+    /// Replaces F5's pace-factor/ratio hybrid outright.
+    var etaSeconds: TimeInterval {
+        guard let legArrivalDate else { return 0 }
+        return max(0, legArrivalDate.timeIntervalSince(.now))
+    }
+
+    /// ETA to the FINAL destination of the whole plan, in seconds from
+    /// now. For a single-destination route (`plan == nil`) this is
+    /// identical to `etaSeconds` — the current leg IS the destination.
+    /// For a multi-stop plan it's `etaSeconds` (the current leg's live,
+    /// Apple-refreshed estimate) plus the PLANNED `travelTime` of every
+    /// leg still ahead — those haven't been ridden yet, so there's no
+    /// live re-fetch signal for them; only the leg in progress gets the
+    /// periodic refresh. Computed (not cached) so it always reflects the
+    /// latest `etaSeconds`/`currentLegIndex` with no extra update sites
+    /// to wire through seed/ingest/reroute/leg-advance.
+    ///
+    /// Used by: `NavigationHUD`'s final-ETA pill (phone shows both this
+    /// AND the per-leg `etaSeconds` — i.e. ETA to the final destination
+    /// AND ETA to the next waypoint, side by side) and `ActiveNavLoop`,
+    /// which sends ONLY this value to the dash as the primary ETA/
+    /// remaining-time TLVs (Martin, 6/2026 — the dash has no room to
+    /// show two ETAs), while the per-leg `etaSeconds` still reaches the
+    /// dash separately via the multi-stop "next waypoint" text label
+    /// (`ActiveNavLoop.nextWaypointLabel`).
+    var finalDestinationEtaSeconds: TimeInterval {
+        guard let plan, currentLegIndex < plan.legs.count else { return etaSeconds }
+        let remainingLegsTime = plan.legs[(currentLegIndex + 1)...]
+            .reduce(0.0) { $0 + ($1.selected?.travelTime ?? 0) }
+        return etaSeconds + remainingLegsTime
+    }
+
+    /// Metres remaining to the FINAL destination of the whole plan: the
+    /// current leg's `remainingDistance` plus the full length of every
+    /// subsequent selected leg. Falls back to `remainingDistance` for a
+    /// single-destination session. Used by the HUD when the ETA card is
+    /// scoped to the final destination (single-destination + track plans),
+    /// so "Distance" counts down to the end of the ride, not to the next
+    /// pass-through via-point.
+    var finalDestinationRemainingDistance: CLLocationDistance {
+        guard let plan, currentLegIndex < plan.legs.count else { return remainingDistance }
+        let remainingLegsDist = plan.legs[(currentLegIndex + 1)...]
+            .reduce(0.0) { $0 + ($1.selected?.distanceMeters ?? 0) }
+        return remainingDistance + remainingLegsDist
+    }
+
+    /// Absolute wall-clock arrival time for the CURRENT LEG — the single
+    /// source of truth `etaSeconds` reads from. Set from a real
+    /// `MKRoute.expectedTravelTime` in `seed()` (start/leg-advance) and
+    /// in `requestReroute()`, and kept fresh mid-leg by
+    /// `refreshEtaFromApple()` on the `etaRefreshInterval` timer. `nil`
+    /// only before the first route is seeded.
+    private var legArrivalDate: Date?
+
+    /// How often to re-query MKDirections for a fresh traffic-aware
+    /// `expectedTravelTime` to the current leg's destination, from the
+    /// rider's live position. 3 min balances staying current against
+    /// hammering MapKit / burning cellular + battery on a long ride.
+    private let etaRefreshInterval: TimeInterval = 180
+
+    /// Owns the periodic ETA re-fetch pump — started in `start()`/
+    /// `start(plan:)`, cancelled in `stop()`. Separate from
+    /// `ActiveNavLoop`'s 1 Hz dash-push pump; this one only talks to
+    /// MKDirections, on its own slower cadence.
+    private var etaRefreshTask: Task<Void, Never>?
+
+    /// The DEPARTING step at the upcoming maneuver node — the step whose
+    /// polyline LEAVES the node. Supplies the OUTGOING heading for the
+    /// geometric turn-direction classifier (`ManeuverKind.classify` →
+    /// `ManeuverGeometry`). NOTE: despite the name this is NOT the step
+    /// whose `.instructions` describe the upcoming maneuver — Apple's
+    /// end-of-polyline convention puts that text on `stepBeforeNext` (the
+    /// step ENDING at the node). Read the upcoming maneuver via
+    /// `upcomingManeuver` / `upcomingInstructions`, never this directly.
+    private(set) var nextStep: MKRoute.Step?
+
+    /// The ARRIVING step the rider is currently COMPLETING — the one whose
+    /// polyline ENDS at the upcoming maneuver node. Two roles: (1) its
+    /// `.instructions` describe the upcoming maneuver (Apple puts the turn
+    /// text on the step that ends at the node), and (2) its polyline tail
+    /// supplies the INCOMING heading for the geometric turn classifier.
+    /// `nil` only in the brief transient before the first GPS fix maps the
+    /// rider onto a step, when classification falls back to text.
+    private(set) var stepBeforeNext: MKRoute.Step?
+
+    /// The step BEFORE `stepBeforeNext`. Used only to carry a roundabout's
+    /// exit ordinal forward across MapKit's split entry/exit roundabout
+    /// steps (the exit step drops the ordinal — see `ManeuverKind.classify`).
+    /// `nil` when the arriving step is the route's first.
+    private(set) var precedingStep: MKRoute.Step?
+
+    /// TRACK ROUTES ONLY — the first real step of the NEXT leg, used to
+    /// classify the maneuver that sits exactly ON the leg boundary.
+    ///
+    /// Why this exists (field report, Ari, 8/2026 — "navigating a GPX route
+    /// it does not give the next upcoming turn"): an imported GPX `<trk>` is
+    /// reduced by Douglas–Peucker to ≤ `navigableCap` points, and each of
+    /// those becomes a waypoint, i.e. a LEG BOUNDARY. Douglas–Peucker keeps
+    /// the points of greatest deviation — which are precisely the corners —
+    /// so the sharper the turn, the more likely it IS a boundary. Measured
+    /// on Ari's own file (65.9 km, 1034 pts → 28 legs): 58% of turns over
+    /// 90° landed on a leg boundary, versus 11% of gentle 30–60° bends.
+    ///
+    /// A turn on the boundary is invisible to both legs: the current leg's
+    /// last step is "arrive at destination" (`ManeuverKind.classify` returns
+    /// `.arrive`), and the next leg's first step departs FROM the corner, so
+    /// the angle is never formed within either route. The rider gets
+    /// "straight ahead" right up to a 90° junction — exactly the report.
+    ///
+    /// Holding the next leg's first step lets `upcomingManeuver` form the
+    /// angle ACROSS the boundary (arriving = this leg's last step,
+    /// departing = next leg's first step) using the same MapKit steps and
+    /// the same classifier as everywhere else. Crucially the maneuver stays
+    /// TEXT-derived where it must be: roundabout exit ordinals come from
+    /// `.instructions`, which a purely geometric approach could never
+    /// recover (the polyline never traces the arms we don't take).
+    ///
+    /// `nil` for every non-track route, and for the final leg. Normal
+    /// point-to-point navigation never populates this and is unaffected.
+    private(set) var nextLegFirstStep: MKRoute.Step?
+
+    /// Distance from current position to the next maneuver.
+    private(set) var distanceToNextStep: CLLocationDistance = 0
+
+    /// F2c: the maneuver after `nextStep` — the look-ahead. Nil if
+    /// `nextStep` is already the destination (no further turns).
+    /// Populated unconditionally; whether we actually emit the
+    /// secondary TLV chain depends on `distanceToNextStep`
+    /// versus the lookahead threshold (decided downstream in
+    /// `ActiveNavLoop`).
+    private(set) var secondNextStep: MKRoute.Step?
+
+    /// Distance from the *current position* to the secondary
+    /// maneuver. This is `distanceToNextStep + nextStep.distance` — the
+    /// length of `nextStep`'s polyline IS the leg from the primary
+    /// maneuver node (its start) to the secondary maneuver node (its
+    /// end), so adding it to the distance-to-primary gives the
+    /// distance-to-secondary. (Previously this added `secondNextStep`'s
+    /// distance — the leg AFTER the secondary node — overshooting the
+    /// look-ahead chip by a whole extra step; field logs 6/2026.)
+    private(set) var distanceToSecondNextStep: CLLocationDistance = 0
+
+    // MARK: - Derived maneuver model (single source of truth)
+    //
+    // Apple's `MKRoute.Step.instructions` describes the maneuver at the
+    // END of that step's polyline (the turn ONTO the next road), so the
+    // step whose `.instructions` name the UPCOMING maneuver is the one the
+    // rider is currently traversing — the ARRIVING step (`stepBeforeNext`),
+    // whose polyline ends at the upcoming node — NOT `nextStep` (whose
+    // polyline LEAVES the node and carries the maneuver AFTER next). These
+    // computed properties are the ONE place that pairing is resolved, so a
+    // consumer can never reintroduce the off-by-one by reading
+    // `nextStep?.instructions` directly.
+
+    /// The fully classified UPCOMING maneuver (text-family + geometry-
+    /// direction). Text/family from the arriving step's instructions;
+    /// direction from the angle between the arriving leg (into the node)
+    /// and the departing leg (`nextStep`, out of the node). `nil` only in
+    /// the pre-first-fix transient when no arriving step is known yet.
+    var upcomingManeuver: ManeuverKind? {
+        guard let arriving = stepBeforeNext else { return nil }
+        // Normal case: the departing step lives in this same route.
+        //
+        // Track-route boundary case: when the maneuver node is the END of
+        // this leg there is no departing step here — the turn continues into
+        // the NEXT leg. Borrow that leg's first step as the departing one so
+        // the angle can be formed across the boundary. `nextLegFirstStep` is
+        // non-nil ONLY for track routes with a next leg (see
+        // `refreshNextLegFirstStep`), so every other kind of navigation
+        // takes the plain `nextStep` path and behaves exactly as before.
+        if let departing = nextStep {
+            return ManeuverKind.classify(arrivingStep: arriving,
+                                         departingStep: departing,
+                                         precedingStep: precedingStep)
+        }
+        guard let borrowed = nextLegFirstStep else {
+            // Genuine end of the route — no next step anywhere. Unchanged.
+            return ManeuverKind.classify(arrivingStep: arriving,
+                                         departingStep: nil,
+                                         precedingStep: precedingStep)
+        }
+        // Only here — a track's synthetic mid-route waypoint — do we override
+        // MapKit's "arrive at destination" wording with the real turn.
+        return ManeuverKind.classify(arrivingStep: arriving,
+                                     departingStep: borrowed,
+                                     precedingStep: precedingStep,
+                                     treatArriveAsTurn: true)
+    }
+
+    /// The localized instruction text for the UPCOMING maneuver — the
+    /// arriving step's `.instructions` (the turn at the end of the leg the
+    /// rider is on), NOT `nextStep`'s (which is one maneuver further on).
+    var upcomingInstructions: String? { stepBeforeNext?.instructions }
+
+    /// The fully classified LOOK-AHEAD (secondary) maneuver — the one
+    /// after `upcomingManeuver`. Its arriving step is `nextStep` (whose
+    /// polyline ends at the secondary node) and its departing step is
+    /// `secondNextStep`. `nil` when there's no step after next (last leg).
+    var lookaheadManeuver: ManeuverKind? {
+        guard let arriving = nextStep, let departing = secondNextStep else { return nil }
+        return ManeuverKind.classify(arrivingStep: arriving,
+                                     departingStep: departing,
+                                     precedingStep: stepBeforeNext)
+    }
+
+    /// True if we're currently off-route (drives the HUD banner). The
+    /// reroute trigger in `ingest(fix:)` uses the same distance test plus
+    /// the hysteresis timestamps below.
+    private(set) var isOffRoute: Bool = false
+
+    /// Whether a reroute is currently in flight.
+    private(set) var isRerouting: Bool = false
+
+    /// Bumped when an off-route recalculation starts and whenever the
+    /// active route is swapped mid-ride (reroute result, live-traffic
+    /// swap, alternative auto-switch, waypoint removed from the dash).
+    /// The nav loop ends the average-speed section on every change: its
+    /// average is measured along the route line, so after a swap it can
+    /// read nonsense. A counter rather than `isRerouting`, which a fast
+    /// MKDirections reply can flip back before the 1 Hz nav loop ever
+    /// samples it. An off-route reroute bumps twice (start + result);
+    /// consumers only compare for change.
+    private(set) var routeRecalculations = 0
+
+    /// Most recent GPS coordinate fed into the navigator via `ingest(fix:)`.
+    /// Read-only for consumers. `nil` until the first fix lands. Minimal
+    /// surface: the navigator already digests the fix; we just retain its
+    /// coordinate.
+    private(set) var currentCoordinate: CLLocationCoordinate2D?
+
+    // MARK: - Route overview geometry (feat/nav-route-overview-map)
+
+    /// Real GPS breadcrumb of where the rider has ACTUALLY been, thinned
+    /// to ~`breadcrumbMinSpacing` m spacing. Drives the grey "travelled"
+    /// part of the navigation overview map. Held ACROSS reroutes (a
+    /// reroute replaces the route *ahead*, never the past) so the
+    /// travelled trace never vanishes when the blue line is swapped —
+    /// the rider keeps a continuous "you came from here" progress bar.
+    /// Reset only on a fresh `start(...)` and `stop()`.
+    private(set) var traveledCoordinates: [CLLocationCoordinate2D] = []
+
+    /// Materialised coordinates of the CURRENT active route (the leg the
+    /// rider is on). Refreshed on every active-route swap — `start`,
+    /// reroute, leg-advance — and NEVER per fix, so slicing it for the
+    /// "ahead" overview each frame is a cheap array op instead of a
+    /// full `MKPolyline` materialisation.
+    private var activeRouteCoordsCache: [CLLocationCoordinate2D] = []
+
+    /// Materialised coordinates of all plan legs AFTER the current one,
+    /// concatenated in order. Empty for single-destination nav and once
+    /// the rider is on the final leg. Refreshed whenever the leg /plan
+    /// changes (`seed` sees the up-to-date `plan`/`currentLegIndex`).
+    /// A reroute recomputes it too (`refreshOverviewCaches`) but the
+    /// content is unchanged — a reroute only swaps the current leg's route.
+    private var subsequentLegsCoordsCache: [CLLocationCoordinate2D] = []
+
+    /// Minimum spacing between retained breadcrumb points. 30 m keeps
+    /// the travelled trace faithful to the road shape on a 150 pt
+    /// overview thumbnail while bounding the array to a few thousand
+    /// points even on a multi-hour ride.
+    private let breadcrumbMinSpacing: CLLocationDistance = 30
+
+    /// The route still AHEAD of the rider, for the overview map: the
+    /// current route sliced from the nearest segment onward, plus any
+    /// subsequent plan legs. Cheap — slices the cached arrays, no
+    /// polyline materialisation. The grey breadcrumb + this blue line
+    /// together span the whole planned route start→finish.
+    var routeAheadCoordinates: [CLLocationCoordinate2D] {
+        guard !activeRouteCoordsCache.isEmpty else { return subsequentLegsCoordsCache }
+        let start = min(max(0, lastSegmentIndex), activeRouteCoordsCache.count - 1)
+        var ahead = Array(activeRouteCoordsCache[start...])
+        ahead.append(contentsOf: subsequentLegsCoordsCache)
+        return ahead
+    }
+
+    // MARK: - Multi-stop plan state (feat/route-waypoints)
+
+    /// The multi-stop plan being navigated, when started via
+    /// `start(plan:)`. nil for the classic single-destination path
+    /// (`start(route:destination:)`), which behaves exactly as before.
+    private(set) var plan: PlannedRoute?
+
+    /// Index into `plan.legs` of the leg currently being navigated.
+    /// `activeRoute` is always the selected MKRoute of this leg (or a
+    /// reroute thereof).
+    private(set) var currentLegIndex: Int = 0
+
+    /// Number of legs still to drive, INCLUDING the current one. 1 on
+    /// the final leg. 0 when not plan-navigating. Drives the HUD's
+    /// "stop N of M" pill.
+    private(set) var remainingWaypoints: Int = 0
+
+    /// Distance (m) to the current leg's end waypoint at which we
+    /// switch to the next leg. Same order of magnitude as a
+    /// destination arrival. Kept below the off-route threshold (60 m)
+    /// so leg-advance wins over a reroute near the waypoint.
+    private let legArrivalThreshold: CLLocationDistance = 30
+
+    /// Arrival radius for the FINAL destination. Kept tight (25 m); the
+    /// rider has stopped, so a few metres is plenty. A fix skipping past
+    /// this radius at speed is caught by the overshoot guard below, so the
+    /// radius itself doesn't need widening.
+    private let destinationArrivalThreshold: CLLocationDistance = 25
+
+    /// Wider "capture" zone. Once a fix lands inside this radius of the
+    /// final destination we arm arrival: from then on EITHER dropping
+    /// under `destinationArrivalThreshold` OR rolling back out (the rider
+    /// physically passed the destination, so `remaining` starts growing
+    /// again) counts as arrival. Without this an overshoot near a
+    /// roadside destination never trips the radius and instead falls
+    /// through to the off-route/reroute path, which spins the rider back
+    /// around toward the target — the reported bug.
+    private let arrivalCaptureRadius: CLLocationDistance = 70
+
+    /// Armed once a fix lands within `arrivalCaptureRadius` of the final
+    /// destination. Reset by seed()/stop() alongside `hasBeenUnderway`.
+    private var arrivalArmed: Bool = false
+
+    /// Closest approach (metres) to the final destination seen since the
+    /// capture zone was armed. Lets us detect an overshoot: when the live
+    /// `remaining` climbs meaningfully above this floor, the rider has
+    /// passed the destination.
+    private var minRemainingSinceArmed: CLLocationDistance = .greatestFiniteMagnitude
+
+    /// Set true once we've been at least 2× the arrival radius away from
+    /// the destination. Guards against firing arrival on the very first
+    /// fix of a short route (where remaining can start below the radius).
+    private var hasBeenUnderway: Bool = false
+
+    /// The rider's position at the first fix of the ride. Used to arm
+    /// `hasBeenUnderway` by PHYSICAL movement, not just by absolute
+    /// distance-to-destination: on a very short route (destination at the
+    /// end of the street, well inside the arrival radius) `remaining`
+    /// never exceeds 2× the radius, so the distance-based arm never fires
+    /// and arrival could never trigger. Moving a clear margin past GPS
+    /// jitter from the start proves the rider actually set off.
+    private var rideStartCoordinate: CLLocationCoordinate2D?
+
+    /// Movement past this many metres from the ride's start also arms
+    /// `hasBeenUnderway`. Comfortably above typical GPS jitter (~10 m) so
+    /// standing still can't false-arm, yet small enough that a
+    /// sub-radius-length route still gets under way.
+    private let underwayMovementThreshold: CLLocationDistance = 15
+
+    /// Wall-clock time of the first fix that sat inside the arrival radius
+    /// while essentially stationary. Drives the proximity fallback below.
+    /// Reset whenever the rider leaves the radius or moves meaningfully.
+    private var stationaryInRadiusSince: Date?
+
+    /// The rider must dwell inside the arrival radius, barely moving, for
+    /// at least this long before the proximity fallback declares arrival.
+    /// Covers the degenerate case of a destination only a few metres away
+    /// that the rider never rides toward (so neither the distance gate nor
+    /// the movement/overshoot guards ever arm) — better to confirm arrival
+    /// than to keep navigating to a spot the rider is already standing on.
+    private let proximityDwellSeconds: TimeInterval = 8
+
+    /// Movement below this many metres between consecutive fixes counts as
+    /// "not moving" for the proximity dwell timer (GPS jitter band).
+    private let stationaryJitterThreshold: CLLocationDistance = 8
+
+    // MARK: - Ride progress + coarse traffic-delay gauge (feat/route-progress-bar)
+
+    /// The WHOLE planned route's distance (metres) captured once when
+    /// navigation starts — the denominator for the progress fraction.
+    /// For a plan it's the sum of every leg's selected distance; for a
+    /// single destination it's the route's own distance. Held for the
+    /// whole ride (never reduced by a reroute — a reroute changes the
+    /// road ahead, but progress is still measured against the trip the
+    /// rider set out on, so the bar doesn't jump backward mid-ride). A
+    /// mid-ride edit (`replacePlan`) re-bases it to ridden-so-far + the
+    /// new legs, so the bar keeps the progress already made.
+    private(set) var plannedTotalDistance: CLLocationDistance = 0
+
+    /// Fractional positions (0…1) of the intermediate pass-through
+    /// waypoints along the WHOLE trip, captured once at start alongside
+    /// `plannedTotalDistance`. Each entry is the cumulative selected-leg
+    /// distance up to that via-point ÷ the planned total, so the progress
+    /// bar can draw a tick where every waypoint sits. The final
+    /// destination (fraction 1.0) is NOT included — it's the bar's end,
+    /// not a mid-route tick. Empty for a single-destination session AND
+    /// for a dense plan (> `RoutePoint.editableListThreshold` via-points,
+    /// e.g. an imported track) where ticks would smear into a comb.
+    /// Fixed for the ride (a reroute doesn't shuffle the ticks), matching
+    /// the fixed `plannedTotalDistance` denominator.
+    private(set) var plannedWaypointFractions: [Double] = []
+
+    /// The new final destination's name after a mid-ride edit changed it
+    /// (`replacePlan`), for the Live Activity title — its attribute is
+    /// fixed at start. nil until then; cleared by `start(plan:)` / `stop()`.
+    private(set) var editedDestinationName: String?
+
+    /// The ride's title for the dash route card and the Live Activity: the
+    /// plan's FINAL stop (not the current leg's via-point, which is what
+    /// `destination` holds), so it also follows a mid-ride edit. nil when not
+    /// navigating; callers fall back to "Free ride" on the dash.
+    var rideTitle: String? {
+        guard isNavigating else { return nil }
+        return plan?.waypoints.last?.name ?? destination?.name
+    }
+
+    /// Fraction of the whole trip completed, 0…1, for the progress bar.
+    /// Measured as travelled ÷ planned-total using the SAME
+    /// `finalDestinationRemainingDistance` the HUD counts down, so the
+    /// bar and the distance readout can never disagree. Clamped and
+    /// guarded against a zero/again-nil denominator (returns 0 before the
+    /// first route seeds). Monotonic while the route is unchanged; a
+    /// mid-ride edit that lengthens the trip re-bases the total, so the
+    /// bar steps back by (covered ÷ new total), never to 0.
+    var rideProgressFraction: Double {
+        guard plannedTotalDistance > 0 else { return 0 }
+        let done = plannedTotalDistance - finalDestinationRemainingDistance
+        return max(0, min(1, done / plannedTotalDistance))
+    }
+
+    // MARK: - Reroute hysteresis state (7h)
+
+    private var offRouteSince: Date?
+    private var lastRerouteAt: Date = .distantPast
+    private let offRouteDistanceThreshold: CLLocationDistance = 60   // m
+    private let offRouteDurationThreshold: TimeInterval = 5          // s
+    private let rerouteCooldown: TimeInterval = 30                   // s
+    /// Wait before the next attempt after a FAILED reroute (timeout, no
+    /// signal). Shorter than `rerouteCooldown`, which is for pacing
+    /// successful swaps: after a failure the rider is still off-route with
+    /// the dash on "recalculating".
+    private let rerouteRetryAfterFailure: TimeInterval = 10         // s
+    /// Hard cap on one MKDirections request from the navigator hooks
+    /// (wired in `AppStatus.wireNavigation`).
+    static let routeRequestTimeout: TimeInterval = 12              // s
+
+    // MARK: - Alternative-route auto-switch (F3, 2026-08)
+
+    /// Alternatives for the CURRENT leg, held alongside `activeRoute` so
+    /// the rider can physically turn onto one and we swap navigation to it
+    /// (rider request 2026-08 "Volba 2"). Refreshed on every active-route
+    /// swap (`seed`): the selected option is the active route, the OTHER
+    /// options of the current leg become the alternatives. Empty for a
+    /// single-destination reroute leg with no alternatives.
+    private(set) var currentAlternatives: [MKRoute] = []
+
+    /// Distance (m) the rider must be from the ACTIVE route AND within of
+    /// an ALTERNATIVE before we consider them to have chosen that
+    /// alternative. Must exceed typical GPS jitter but stay under the
+    /// reroute threshold so an intentional fork is caught before a reroute
+    /// fires. 25 m: a lane-width fork is enough to disambiguate.
+    private let altSwitchProximityThreshold: CLLocationDistance = 25
+
+    /// Consecutive fixes the rider must be committed to an alternative
+    /// before we swap. Guards against a momentary GPS excursion onto a
+    /// parallel road. ~3 fixes ≈ a few seconds at nav update rate.
+    private let altSwitchConfirmFixes: Int = 3
+
+    /// Per-alternative run of consecutive "rider is on this alt, off the
+    /// active route" fixes. Keyed by the alt's index in
+    /// `currentAlternatives`. Reset whenever the rider is back on the
+    /// active route or the alternatives change.
+    private var altCommitStreak: [Int: Int] = [:]
+
+    /// Fired whenever `currentAlternatives` changes (`seed`: start, leg
+    /// swap, alt auto-switch; `stop`: clear) so MapPickerView can push the
+    /// render models into MapViewSource. A reroute does NOT refire it.
+    /// The navigator itself never touches MapViewSource.
+    var onAlternativesChanged: (@MainActor ([MKRoute]) -> Void)?
+
+    // MARK: - Internals
+
+    private var lastSegmentIndex: Int = 0
+    private let log = Logger(subsystem: "eu.kolaczek.tripperdashpp", category: "ActiveNavigator")
+
+    /// Caller hook for when we lose the route and want a new one. Set by
+    /// AppStatus (`wireNavigation`) so the navigator can call back into
+    /// RoutingService without owning a reference to it.
+    ///
+    /// DUAL PURPOSE (F6, Martin 7/2026): also used by
+    /// `refreshEtaFromApple()` for the periodic ETA-only re-fetch — same
+    /// (origin, destination) → MKRoute? shape, so there's nothing
+    /// reroute-specific about the signature. The two callers just do
+    /// different things with the result: `requestReroute` swaps in the
+    /// WHOLE route (polyline, tile cache, `onActiveRouteChanged`);
+    /// `refreshEtaFromApple` only reads `route.expectedTravelTime` and
+    /// discards the rest. Reusing the hook (rather than adding a second
+    /// one) means there's only one place to wire in `AppStatus` and no
+    /// second hook to forget.
+    var onRerouteRequested: ((@MainActor (CLLocationCoordinate2D, Destination) async -> MKRoute?))?
+
+    /// Rider-initiated "exit navigation" (dash in-menu button `0x12`).
+    /// Fired when the rider ends the whole ride from the dash. The View
+    /// (MapPickerView) registers its full `stopNavigation()` teardown here
+    /// — stream stop, tile/polyline/route-cache clear, staged-destination
+    /// reset, slide back to the picker — so the dash button takes the exact
+    /// same path as tapping "End" in the app. Nil when no session owns it.
+    var onExitNavRequested: (@MainActor () -> Void)?
+
+    /// Live-traffic reroute hook. Returns Apple's current traffic-aware
+    /// route ALTERNATIVES from the rider's live position to the current
+    /// destination (i.e. `MKDirections` with `requestsAlternateRoutes`),
+    /// or nil/empty on failure. Distinct from `onRerouteRequested` (which
+    /// returns a single best route for OFF-route recovery): the traffic
+    /// check needs the WHOLE candidate set so it can pick the fastest
+    /// candidate that is a genuinely different road from the active route
+    /// (`trafficRerouteDecision`). Wired by AppStatus. `nil` when unwired →
+    /// the periodic check no-ops (the feature toggle is
+    /// `trafficRerouteEnabled`).
+    var onTrafficRoutesRequested: ((@MainActor (CLLocationCoordinate2D, Destination) async -> [MKRoute]))?
+
+    /// Mirror of `DashNavSettings.trafficRerouteEnabled`. Set by AppStatus
+    /// on start + whenever the setting changes. When false the periodic
+    /// traffic check is skipped entirely (no extra MKDirections work).
+    var trafficRerouteEnabled: Bool = false
+
+    /// Mirror of `DashNavSettings.trafficRerouteSavingSeconds` — the
+    /// minimum time a faster alternative must save before we auto-swap.
+    var trafficRerouteSavingSeconds: TimeInterval = 300
+
+    /// Caller hook fired whenever the active route is replaced —
+    /// fresh `start()`, leg-advance, alt auto-switch AND every successful
+    /// (off-route or live-traffic) reroute. Callers wire
+    /// this to: (1) push the new polyline into `MapViewSource` so
+    /// the dash + Map UI render the right line, (2) tear down the
+    /// stale `RouteTileCache` and pre-render a new one. Without
+    /// this, a reroute updates the navigator's internal state but
+    /// the rider keeps seeing the old blue line until they restart
+    /// navigation from scratch.
+    var onActiveRouteChanged: (@MainActor (MKRoute) async -> Void)?
+
+    /// Fired once when the rider reaches the FINAL destination (single
+    /// route, or the last leg of a plan). AppStatus wires this to speak
+    /// the arrival prompt; the stream stays up and MapPickerView's
+    /// `finishArrival` later swaps it to free-ride. Distinct from a
+    /// leg-advance, which is internal and silent.
+    var onArrived: (@MainActor () -> Void)?
+
+    // MARK: - API
+
+    /// Classic single-destination entry point. Currently has no caller —
+    /// the app starts every ride (incl. single destinations) via
+    /// `start(plan:)`, and reroute swaps via `installSwappedRoute`.
+    /// Internally seeds with no plan, so leg-advance never triggers.
+    func start(route: MKRoute, destination: Destination) async {
+        self.plan = nil
+        self.currentLegIndex = 0
+        self.remainingWaypoints = 0
+        self.hasArrived = false
+        self.hasBeenUnderway = false
+        self.rideStartCoordinate = nil
+        self.arrivalArmed = false
+        self.minRemainingSinceArmed = .greatestFiniteMagnitude
+        self.stationaryInRadiusSince = nil
+        self.traveledCoordinates = []   // fresh ride → empty breadcrumb
+        // Progress gauge baseline: a single destination IS the whole trip.
+        self.plannedTotalDistance = route.distance
+        self.plannedWaypointFractions = []   // no via-points on a direct route
+        seed(route: route, destination: destination)
+        self.isNavigating = true
+        log.info("Navigation started to \(destination.name, privacy: .public) — \(Int(route.distance)) m / \(Int(route.expectedTravelTime)) s")
+        await onActiveRouteChanged?(route)
+    }
+
+    /// Multi-stop entry point (feat/route-waypoints). Drives the legs of
+    /// `plan` one at a time starting at `fromLegIndex`. `activeRoute` is
+    /// the selected MKRoute of the current leg; everything downstream
+    /// (PolylineMath, tile cache, ActiveNavLoop, maneuver TLVs) sees a
+    /// single MKRoute exactly as in the single-destination case.
+    func start(plan: PlannedRoute, fromLegIndex: Int = 0) async {
+        guard plan.isComputed, !plan.legs.isEmpty else {
+            log.error("start(plan:) called with an uncomputed plan — ignoring")
+            return
+        }
+        self.plan = plan
+        self.currentLegIndex = max(0, min(fromLegIndex, plan.legs.count - 1))
+        self.remainingWaypoints = plan.legs.count - self.currentLegIndex
+        self.hasArrived = false
+        self.hasBeenUnderway = false
+        self.rideStartCoordinate = nil
+        self.arrivalArmed = false
+        self.minRemainingSinceArmed = .greatestFiniteMagnitude
+        self.stationaryInRadiusSince = nil
+        self.traveledCoordinates = []   // fresh ride → empty breadcrumb
+
+        let leg = plan.legs[self.currentLegIndex]
+        guard let route = leg.selected?.route,
+              let destWp = plan.waypoint(id: leg.toWaypointId) else {
+            log.error("start(plan:) — current leg has no selected route — ignoring")
+            return
+        }
+        seed(route: route, destination: destWp.asDestination)
+        self.isNavigating = true
+        setProgressBaseline(plan: plan, fromLegIndex: self.currentLegIndex, alreadyCovered: 0)
+        self.editedDestinationName = nil
+        log.info("Multi-stop navigation started — leg \(self.currentLegIndex + 1)/\(plan.legs.count) to \(destWp.name, privacy: .public)")
+        await onActiveRouteChanged?(route)
+    }
+
+    /// Progress gauge baseline: sum EVERY leg's selected distance (from
+    /// `fromLegIndex` to the end) so the bar measures against the whole
+    /// remaining trip. Shared by `start(plan:)` and `replacePlan(_:)`;
+    /// `alreadyCovered` is the distance ridden before a mid-ride edit.
+    private func setProgressBaseline(plan: PlannedRoute, fromLegIndex: Int, alreadyCovered: Double) {
+        let plannedLegs = Array(plan.legs[fromLegIndex...])
+        let legDistances = plannedLegs.map { $0.selected?.distanceMeters ?? 0 }
+        let baseline = Self.progressBaseline(alreadyCovered: alreadyCovered, legDistances: legDistances)
+        self.plannedTotalDistance = baseline.total
+        // Waypoint ticks: the boundary AFTER each leg except the last is a
+        // pass-through via-point. Its bar position is the cumulative length
+        // up to that boundary ÷ total. The final destination (the end of
+        // the last leg) is deliberately excluded — it's the bar's end.
+        // Suppressed entirely for a dense plan (an imported/recorded track
+        // staged for navigation carries hundreds of via-points): past the
+        // planner's editable-list threshold the ticks would smear into an
+        // unreadable comb, so we mirror that cutoff and draw none.
+        let viaCount = legDistances.count - 1   // boundaries before the final dest
+        if viaCount <= RoutePoint.editableListThreshold {
+            self.plannedWaypointFractions = baseline.fractions
+        } else {
+            self.plannedWaypointFractions = []
+        }
+    }
+
+    /// Pure progress-bar math: total = `alreadyCovered` + Σ legs, and a
+    /// tick at each via-point boundary at (covered + cumulative) ÷ total.
+    /// A mid-ride edit passes the distance already ridden so the bar keeps
+    /// it instead of dropping to 0 %. No ticks when the total is 0.
+    nonisolated static func progressBaseline(alreadyCovered: Double,
+                                             legDistances: [Double]) -> (total: Double, fractions: [Double]) {
+        let covered = max(0, alreadyCovered)
+        let total = covered + legDistances.reduce(0.0, +)
+        guard total > 0 else { return (total, []) }
+        var cumulative = covered
+        var fractions: [Double] = []
+        for dist in legDistances.dropLast() {
+            cumulative += dist
+            fractions.append(cumulative / total)
+        }
+        return (total, fractions)
+    }
+
+    /// Seed all per-leg display + geometry state from a single route.
+    /// Shared by both entry points and by leg-advance. Does NOT flip
+    /// `isNavigating` or fire `onActiveRouteChanged` — the caller owns
+    /// those so it can order them correctly.
+    private func seed(route: MKRoute, destination: Destination) {
+        self.activeRoute = route
+        self.destination = destination
+        self.lastSegmentIndex = 0
+        self.offRouteSince = nil
+        self.isOffRoute = false
+        // Seed initial display values from the route itself.
+        self.remainingDistance = route.distance
+        self.legArrivalDate = Date(timeIntervalSinceNow: route.expectedTravelTime)
+        // Seed the maneuver model to the SAME shape ingest() produces on
+        // the first fix: the rider is about to traverse steps[0] (the
+        // ARRIVING step whose polyline ends at the first maneuver node and
+        // whose `.instructions` name that maneuver), departing via
+        // steps[1]. Reading text from the arriving step — not the
+        // departing one — is the off-by-one fix; see `upcomingManeuver`.
+        self.stepBeforeNext = route.steps.first          // arriving (text + incoming leg)
+        self.nextStep = route.steps.dropFirst().first    // departing (outgoing leg)
+        self.precedingStep = nil                         // nothing before the first step
+        self.distanceToNextStep = route.steps.first?.distance ?? 0
+        self.secondNextStep = route.steps.dropFirst(2).first
+        // distance-to-secondary = distance-to-primary + the primary
+        // (departing) step's own length (primary node → secondary node).
+        self.distanceToSecondNextStep = (route.steps.first?.distance ?? 0)
+            + (route.steps.dropFirst().first?.distance ?? 0)
+        // Refresh the overview caches. `plan`/`currentLegIndex` are
+        // already set by the caller (start/leg-advance) before seed runs,
+        // so this picks up the right "subsequent legs" set.
+        refreshOverviewCaches()
+        refreshNextLegFirstStep()
+        // F6: (re)start the periodic Apple ETA re-fetch pump. Called
+        // from the ONE place all three lifecycle entry points
+        // (start/start-plan/leg-advance) funnel through, so there's no
+        // extra call site to remember. Safe to "restart the clock" on a
+        // leg-advance — `legArrivalDate` was just set fresh above anyway.
+        startEtaRefreshLoop()
+        // F3: recompute this leg's alternatives (non-selected options) so
+        // the dash draws them grey and the rider can fork onto one.
+        refreshAlternatives()
+    }
+
+    /// Recompute the cached overview geometry — the current route's
+    /// coordinates and the concatenated coordinates of all plan legs
+    /// after the current one. Called on every active-route swap
+    /// (`seed`, reroute), NEVER per fix. The breadcrumb is deliberately
+    /// untouched here: a reroute/leg-advance replaces the route ahead,
+    /// not the travelled past.
+    private func refreshOverviewCaches() {
+        activeRouteCoordsCache = activeRoute?.polyline.coordinateList() ?? []
+        guard let plan, currentLegIndex < plan.legs.count - 1 else {
+            subsequentLegsCoordsCache = []
+            return
+        }
+        var tail: [CLLocationCoordinate2D] = []
+        for legIdx in (currentLegIndex + 1)..<plan.legs.count {
+            guard plan.legs.indices.contains(legIdx),
+                  let route = plan.legs[legIdx].selected?.route else { continue }
+            tail.append(contentsOf: route.polyline.coordinateList())
+        }
+        subsequentLegsCoordsCache = tail
+    }
+
+    /// Populate `nextLegFirstStep` — the departing step used to classify a
+    /// maneuver sitting exactly ON a leg boundary. See that property's doc
+    /// for the full rationale and the field measurements.
+    ///
+    /// Deliberately narrow. It bails out unless ALL of these hold:
+    ///   1. there IS a plan (single-destination navigation is untouched),
+    ///   2. the plan is a TRACK (`isTrack`) — a multi-STOP plan's waypoints
+    ///      are real destinations the rider chose, where "arrive at the
+    ///      stop" is the correct maneuver and must not be replaced by the
+    ///      turn out of the car park,
+    ///   3. a next leg exists (never on the final leg — arrival stays
+    ///      arrival),
+    ///   4. that leg has a selected route with at least one step.
+    /// Any failure clears the property, so a stale step from a previous leg
+    /// can never leak into the next one.
+    private func refreshNextLegFirstStep() {
+        guard let plan, plan.isTrack,
+              currentLegIndex + 1 < plan.legs.count,
+              plan.legs.indices.contains(currentLegIndex + 1),
+              let route = plan.legs[currentLegIndex + 1].selected?.route,
+              let first = route.steps.first
+        else {
+            nextLegFirstStep = nil
+            return
+        }
+        nextLegFirstStep = first
+    }
+
+    /// Recompute `currentAlternatives` = the NON-selected route options of
+    /// the current leg (single-destination nav with a plan == nil leg has
+    /// no options, so this clears). Resets the per-alt commit streaks and
+    /// notifies `onAlternativesChanged` so the dash re-renders the grey
+    /// lines + ETA bubbles.
+    private func refreshAlternatives() {
+        var alts: [MKRoute] = []
+        if let plan, plan.legs.indices.contains(currentLegIndex) {
+            let leg = plan.legs[currentLegIndex]
+            let selIdx = leg.selectedOptionIndex
+            for (i, opt) in leg.options.enumerated() where i != selIdx {
+                alts.append(opt.route)
+            }
+        }
+        currentAlternatives = alts
+        altCommitStreak = [:]
+        onAlternativesChanged?(alts)
+    }
+
+    /// F3 auto-switch: if the rider has physically committed to one of the
+    /// current leg's alternatives — clearly OFF the active route AND ON an
+    /// alternative for `altSwitchConfirmFixes` consecutive fixes — swap
+    /// navigation onto that alternative (select it in the plan, reseed).
+    /// Returns true if a swap happened (caller returns early — the next
+    /// tick ingests against the new active route). Runs BEFORE the
+    /// off-route/reroute logic so an intentional fork is caught before a
+    /// reroute would fire. No-op when there are no alternatives.
+    private func maybeSwitchToAlternative(at coord: CLLocationCoordinate2D,
+                                          distFromActive: CLLocationDistance) async -> Bool {
+        guard !currentAlternatives.isEmpty,
+              let plan,
+              plan.legs.indices.contains(currentLegIndex) else { return false }
+
+        // Only consider a switch once the rider is meaningfully OFF the
+        // active route — otherwise overlapping geometry near a fork would
+        // ping-pong. One lane-width clears typical GPS jitter.
+        guard distFromActive > altSwitchProximityThreshold else {
+            altCommitStreak = [:]
+            return false
+        }
+
+        // Find the alternative the rider is closest to AND within the
+        // proximity threshold of.
+        var bestAlt: Int? = nil
+        var bestDist = altSwitchProximityThreshold
+        for (i, route) in currentAlternatives.enumerated() {
+            let (d, _) = PolylineMath.nearestSegment(on: route.polyline, from: 0, to: coord)
+            if d <= bestDist {
+                bestDist = d
+                bestAlt = i
+            }
+        }
+
+        guard let chosen = bestAlt else {
+            // Off the active route but not on any alternative — let the
+            // normal reroute path handle it. Clear streaks.
+            altCommitStreak = [:]
+            return false
+        }
+
+        // Confirm commitment across consecutive fixes; reset every other
+        // alt's streak so a wobble between two alts doesn't accumulate.
+        let streak = (altCommitStreak[chosen] ?? 0) + 1
+        altCommitStreak = [chosen: streak]
+        guard streak >= altSwitchConfirmFixes else { return false }
+
+        // Map the chosen alternative (index among NON-selected options)
+        // back to its absolute option index on the leg, then select it.
+        let leg = plan.legs[currentLegIndex]
+        let selIdx = leg.selectedOptionIndex
+        let nonSelected = leg.options.indices.filter { $0 != selIdx }
+        guard nonSelected.indices.contains(chosen) else { return false }
+        let newOptionIndex = nonSelected[chosen]
+        guard leg.options.indices.contains(newOptionIndex) else { return false }
+        let newRoute = leg.options[newOptionIndex].route
+        // Keep the leg's end waypoint as the destination — an alternative
+        // is just a different road to the SAME leg endpoint.
+        let dest = plan.waypoint(id: leg.toWaypointId)?.asDestination
+            ?? destination
+
+        log.info("Auto-switch: rider forked onto alternative \(chosen) of leg \(self.currentLegIndex + 1) — swapping active route")
+        plan.setSelectedOption(legIndex: currentLegIndex, optionIndex: newOptionIndex)
+        // Reseed the leg's display/geometry state to the new route, then
+        // fire the route-changed hook exactly like a reroute / leg-advance.
+        // seed() also calls refreshAlternatives(), so the OLD active route
+        // becomes one of the new alternatives automatically.
+        guard let dest else { return false }
+        routeRecalculations += 1
+        seed(route: newRoute, destination: dest)
+        await onActiveRouteChanged?(newRoute)
+        return true
+    }
+
+    /// Append a fresh fix to the travelled breadcrumb, thinned so points
+    /// are at least `breadcrumbMinSpacing` apart. Keeps the trace honest
+    /// to the road shape without unbounded growth on a long ride.
+    private func appendBreadcrumb(_ coord: CLLocationCoordinate2D) {
+        guard let last = traveledCoordinates.last else {
+            traveledCoordinates.append(coord)
+            return
+        }
+        if PolylineMath.haversine(last, coord) >= breadcrumbMinSpacing {
+            traveledCoordinates.append(coord)
+        }
+    }
+
+    func stop() {
+        log.info("Navigation stopped")
+        self.isNavigating = false
+        self.activeRoute = nil
+        self.destination = nil
+        self.remainingDistance = 0
+        self.nextStep = nil
+        self.stepBeforeNext = nil
+        self.precedingStep = nil
+        self.nextLegFirstStep = nil
+        self.distanceToNextStep = 0
+        self.secondNextStep = nil
+        self.distanceToSecondNextStep = 0
+        // F6: stop the periodic Apple re-fetch pump and drop the
+        // countdown target so the next route starts with no stale
+        // arrival time hanging around (`etaSeconds` reads back as 0
+        // automatically once `legArrivalDate` is nil).
+        etaRefreshTask?.cancel()
+        etaRefreshTask = nil
+        // F3: drop any alternatives and notify so the dash clears the
+        // grey lines + ETA bubbles.
+        currentAlternatives = []
+        altCommitStreak = [:]
+        onAlternativesChanged?([])
+        self.legArrivalDate = nil
+        self.isOffRoute = false
+        self.offRouteSince = nil
+        // Multi-stop: drop the plan so the next session starts fresh.
+        self.plan = nil
+        self.currentLegIndex = 0
+        self.remainingWaypoints = 0
+        // Arrival state — reset so the next route starts clean.
+        self.hasArrived = false
+        self.hasBeenUnderway = false
+        self.rideStartCoordinate = nil
+        self.arrivalArmed = false
+        self.minRemainingSinceArmed = .greatestFiniteMagnitude
+        self.stationaryInRadiusSince = nil
+        // Overview geometry — drop breadcrumb + caches so the next ride
+        // starts with an empty progress bar.
+        self.traveledCoordinates = []
+        self.activeRouteCoordsCache = []
+        self.subsequentLegsCoordsCache = []
+        // Progress gauge — drop the baseline so the next ride re-captures it.
+        self.plannedTotalDistance = 0
+        self.plannedWaypointFractions = []
+        self.editedDestinationName = nil
+    }
+
+    /// Reached the final destination. Flip into the `hasArrived` display
+    /// state (HUD shows the "You've arrived" card) and fire `onArrived`
+    /// so AppStatus speaks the arrival prompt. We DON'T call stop()
+    /// here — the HUD needs `hasArrived == true` for the dismiss beat;
+    /// MapPickerView calls stop() after the auto-dismiss delay.
+    private func handleArrival() {
+        log.info("Arrived at destination \(self.destination?.name ?? "?", privacy: .public)")
+        self.hasArrived = true
+        // NOTE: deliberately do NOT touch `isNavigating` here. MapPickerView's
+        // `mode` is derived from `isNavigating`, so flipping it now would
+        // unmount the HUD in the same beat `hasArrived` goes true — the
+        // "You've arrived" card would never render. The HUD stays up showing
+        // the arrival card; MapPickerView calls `stop()` (which clears
+        // `isNavigating`) after the 4 s auto-dismiss.
+        onArrived?()
+    }
+
+    /// Push a fresh GPS fix into the navigator. Call from a location
+    /// observer wherever the app already digests fixes (today:
+    /// `AppStatus.navigatorIngest(_:)`).
+    func ingest(fix: Fix) async {
+        guard isNavigating, let route = activeRoute else { return }
+        let coord = fix.coordinate
+        let previousCoordinate = self.currentCoordinate
+        self.currentCoordinate = coord
+        // Record the travelled trace (thinned). Drives the grey
+        // "where you've been" line on the overview map; held across
+        // reroutes so the progress bar keeps its history.
+        appendBreadcrumb(coord)
+
+        let (distFromRoute, segIdx) = PolylineMath.nearestSegment(
+            on: route.polyline,
+            from: lastSegmentIndex,
+            to: coord
+        )
+        self.lastSegmentIndex = segIdx
+
+        let remaining = PolylineMath.remainingDistance(
+            on: route.polyline,
+            from: segIdx,
+            currentCoord: coord
+        )
+        self.remainingDistance = remaining
+
+        // F3 auto-switch (Volba 2): if the rider has physically turned onto
+        // one of this leg's alternatives, swap navigation to it BEFORE any
+        // leg-advance / arrival / reroute logic. On a successful swap the
+        // active route (and alternatives) are replaced; return so the next
+        // fix ingests against the new route.
+        if await maybeSwitchToAlternative(at: coord, distFromActive: distFromRoute) {
+            return
+        }
+
+        // Arm the "been under way" guard so a short route can't fire
+        // arrival on its very first fix (where remaining may start small).
+        // Two independent ways to arm, whichever comes first:
+        //  1) Distance-to-destination exceeded 2× the arrival radius — the
+        //     normal case for any route longer than ~50 m.
+        //  2) Physical movement past `underwayMovementThreshold` from the
+        //     ride's start — the ONLY way a very short route (destination
+        //     already inside the arrival radius, e.g. the end of the
+        //     street) ever gets under way, since its `remaining` never
+        //     crosses the distance gate.
+        if rideStartCoordinate == nil { rideStartCoordinate = coord }
+        if remaining > destinationArrivalThreshold * 2 { hasBeenUnderway = true }
+        if let start = rideStartCoordinate,
+           PolylineMath.haversine(start, coord) > underwayMovementThreshold {
+            hasBeenUnderway = true
+        }
+
+        // Multi-stop leg advance: if we're plan-navigating and within
+        // the arrival radius of the CURRENT leg's end waypoint, and
+        // there's another leg after this one, switch to it. This runs
+        // BEFORE off-route/reroute so arriving at an intermediate
+        // waypoint advances the leg instead of triggering a reroute to
+        // the same waypoint. Returns early — the next tick ingests
+        // against the new leg's route.
+        if let plan, currentLegIndex < plan.legs.count - 1,
+           remaining <= legArrivalThreshold {
+            await advanceToNextLeg(in: plan)
+            return
+        }
+
+        // Final-destination arrival. True for a single-destination route
+        // (plan == nil) and for the last leg of a multi-stop plan. Runs
+        // AFTER leg-advance so intermediate waypoints advance instead of
+        // "arriving". The `hasBeenUnderway` guard blocks a t=0 false-fire.
+        let isFinalLeg = (plan == nil) || (currentLegIndex >= (plan?.legs.count ?? 1) - 1)
+        if isFinalLeg, hasBeenUnderway, !hasArrived {
+            // Arm the capture zone + track the closest approach once the
+            // rider gets near the destination. This lets an overshoot
+            // (rolling PAST a roadside destination) count as an arrival
+            // instead of falling through to reroute, which would spin the
+            // rider back toward the target.
+            if remaining <= arrivalCaptureRadius {
+                arrivalArmed = true
+            }
+            if arrivalArmed {
+                minRemainingSinceArmed = min(minRemainingSinceArmed, remaining)
+
+                // 1) Normal case: a fix landed inside the tight radius.
+                let insideRadius = remaining <= destinationArrivalThreshold
+                // 2) Overshoot case: we got close (within the tight radius,
+                //    give or take), then `remaining` climbed back up by a
+                //    clear margin — the rider physically passed the point.
+                let overshot = minRemainingSinceArmed <= destinationArrivalThreshold + 10
+                    && remaining > minRemainingSinceArmed + 15
+
+                if insideRadius || overshot {
+                    handleArrival()
+                    return
+                }
+            }
+        }
+
+        // Proximity fallback (degenerate case): the destination is only a
+        // few metres away and the rider NEVER rides toward it — so neither
+        // the distance gate nor the movement/overshoot guards ever arm
+        // `hasBeenUnderway`, and the block above can't fire. Rather than
+        // navigate forever to a spot the rider is already standing on,
+        // confirm arrival once they've DWELLED inside the radius, barely
+        // moving, for `proximityDwellSeconds`. Deliberately independent of
+        // `hasBeenUnderway`. The dwell + jitter guard stops a rider merely
+        // passing THROUGH the radius mid-ride from tripping it.
+        if isFinalLeg, !hasArrived, remaining <= destinationArrivalThreshold {
+            let movedSinceLastFix = previousCoordinate
+                .map { PolylineMath.haversine($0, coord) } ?? 0
+            if movedSinceLastFix <= stationaryJitterThreshold {
+                if stationaryInRadiusSince == nil { stationaryInRadiusSince = .now }
+                if let since = stationaryInRadiusSince,
+                   Date.now.timeIntervalSince(since) >= proximityDwellSeconds {
+                    handleArrival()
+                    return
+                }
+            } else {
+                // Moving through the radius — not a dwell. Restart the timer.
+                stationaryInRadiusSince = nil
+            }
+        } else {
+            // Left the radius (or already arrived) — clear the dwell timer.
+            stationaryInRadiusSince = nil
+        }
+
+        // F6: no per-fix ETA recompute — `etaSeconds` is a computed
+        // property reading `legArrivalDate` against wall-clock `.now`
+        // (see its doc-comment). The countdown updates itself on every
+        // access; `ingest(fix:)` no longer touches ETA at all. The
+        // periodic `refreshEtaFromApple()` pump (started in `seed()`) is
+        // the ONLY thing that moves `legArrivalDate`, aside from the
+        // seed/reroute/leg-advance lifecycle hooks.
+
+        // Maneuver lookup. `nextStepIndex` returns the step whose polyline
+        // STARTS at the upcoming maneuver node — the DEPARTING step
+        // (`nextStep`). The step the rider is currently traversing, whose
+        // polyline ENDS at that node, is the ARRIVING step
+        // (`stepBeforeNext`). Apple writes the maneuver text on the
+        // ARRIVING step (the turn at the END of its polyline), so the
+        // upcoming maneuver's text/family come from `stepBeforeNext` while
+        // its turn ANGLE comes from arriving→departing geometry. The
+        // derived `upcomingManeuver` / `upcomingInstructions` resolve that
+        // pairing — consumers must read those, never `nextStep.instructions`.
+        if let stepIdx = PolylineMath.nextStepIndex(in: route, afterPolylineIndex: segIdx),
+           stepIdx < route.steps.count {
+            let step = route.steps[stepIdx]            // DEPARTING (leaves the node)
+            self.nextStep = step
+            // ARRIVING step = the one BEFORE the departing step; its
+            // polyline ends at the node and its `.instructions` name the
+            // upcoming maneuver. nil only if the departing step is the
+            // route's first (no incoming leg yet).
+            self.stepBeforeNext = stepIdx > 0 ? route.steps[stepIdx - 1] : nil
+            // PRECEDING step (before arriving) — only used to carry a
+            // roundabout's exit ordinal across MapKit's split entry/exit
+            // steps. nil when the arriving step is the route's first.
+            self.precedingStep = stepIdx > 1 ? route.steps[stepIdx - 2] : nil
+            self.distanceToNextStep = PolylineMath.haversine(
+                coord,
+                step.polyline.firstCoordinate ?? coord
+            )
+            // F2c: secondary (look-ahead) maneuver = the step AFTER the
+            // departing one. The distance from the rider to the SECONDARY
+            // node is "distance to the primary node" plus the length of
+            // the DEPARTING step's own polyline (`step.distance`), which is
+            // exactly the primary-node → secondary-node leg. The previous
+            // code added `secondStep.distance` — the leg AFTER the
+            // secondary node — overshooting by a whole step (field logs
+            // 6/2026 measured ~+160 m on the first maneuver).
+            let secondIdx = stepIdx + 1
+            if secondIdx < route.steps.count {
+                self.secondNextStep = route.steps[secondIdx]
+                self.distanceToSecondNextStep = self.distanceToNextStep
+                    + step.distance
+            } else {
+                self.secondNextStep = nil
+                self.distanceToSecondNextStep = 0
+            }
+        } else {
+            // NO STEP AHEAD IN THIS LEG — the rider has passed the last
+            // maneuver node and is riding the final stretch to the leg's
+            // end. `nextStepIndex` returns nil here (no step start lies
+            // beyond `segIdx`), and before this `else` existed the whole
+            // block above was simply skipped: `distanceToNextStep`,
+            // `nextStep`, `stepBeforeNext` and the look-ahead all KEPT
+            // their last values and went stale until the leg boundary
+            // reseeded them.
+            //
+            // On a normal point-to-point route that tail is short. On an
+            // imported GPX `<trk>` it is the dominant case: Douglas–Peucker
+            // reduces the track to ≤`RoutePoint.navigableCap` waypoints, so
+            // a leg is often ONE straight-ish hop with no intermediate
+            // junction at all — measured on Ari's 2Flags.gpx (752 pts,
+            // 52.6 km, 39 legs) the frozen tail covers 100% of every leg
+            // when MapKit emits no mid-leg maneuver. That is the field
+            // report: "it takes quite a long way after the turn to update
+            // how far the next turn is" (the frozen distance) and "it does
+            // not show which direction you need to turn when you get to
+            // the turn" (the frozen/`.arrive` glyph).
+            //
+            // The honest answer for this state is that the upcoming
+            // maneuver IS the end of the leg. So:
+            //   • arriving  = the last step with real geometry (its
+            //     polyline ENDS at the leg's end node, and Apple writes
+            //     that node's text on it),
+            //   • departing = nothing in THIS route — which is precisely
+            //     the `nextStep == nil` condition `upcomingManeuver`
+            //     needs before it will borrow `nextLegFirstStep` and form
+            //     the turn angle ACROSS the boundary (PR #120). Leaving a
+            //     stale `nextStep` here is why that fix could almost never
+            //     fire: the borrow is guarded on `nextStep == nil`, and the
+            //     freeze kept it non-nil.
+            //   • distance  = `remaining`, the live distance along the
+            //     polyline to the leg's end, so it counts down every fix
+            //     instead of sitting on a stale number.
+            //
+            // Scope note: this branch is NOT limited to track routes. Any
+            // route whose terminal `arrive` step has an empty polyline ends
+            // in a tail where `nextStepIndex` returns nil, so a plain
+            // point-to-point route takes this path for its final stretch
+            // too (modelled: the last ~36% of a short A→B route). That is
+            // intended — the old behaviour there was the same freeze, just
+            // shorter and therefore unnoticed. What must NOT change is
+            // mid-leg behaviour, and that is guaranteed by the `if` branch
+            // above being byte-for-byte untouched.
+            //
+            // The look-ahead is cleared rather than left stale: a wrong
+            // secondary chip is worse than none.
+            self.nextStep = nil
+            let geometricSteps = route.steps.filter { $0.polyline.pointCount > 0 }
+            self.stepBeforeNext = geometricSteps.last ?? route.steps.last
+            self.precedingStep = geometricSteps.count > 1
+                ? geometricSteps[geometricSteps.count - 2]
+                : nil
+            self.distanceToNextStep = remaining
+            self.secondNextStep = nil
+            self.distanceToSecondNextStep = 0
+        }
+
+        // On-route detection + hysteresis-based reroute trigger.
+        let nowOff = distFromRoute > offRouteDistanceThreshold
+        if nowOff {
+            if offRouteSince == nil { offRouteSince = .now }
+            self.isOffRoute = true
+            if let since = offRouteSince,
+               Date.now.timeIntervalSince(since) >= offRouteDurationThreshold,
+               Date.now.timeIntervalSince(lastRerouteAt) >= rerouteCooldown,
+               !isRerouting {
+                await requestReroute(from: coord)
+            }
+        } else {
+            offRouteSince = nil
+            self.isOffRoute = false
+        }
+    }
+
+    // MARK: - Reroute
+
+    private func requestReroute(from coord: CLLocationCoordinate2D) async {
+        guard let dest = destination, let cb = onRerouteRequested else { return }
+        routeRecalculations += 1
+        isRerouting = true
+        defer { isRerouting = false }
+        lastRerouteAt = .now
+        log.info("Requesting reroute to \(dest.name, privacy: .public)")
+        if let newRoute = await cb(coord, dest) {
+            log.info("Reroute succeeded — swapping active route")
+            await installSwappedRoute(newRoute)
+        } else {
+            // Back-date the cooldown clock so the next attempt comes
+            // `rerouteRetryAfterFailure` from NOW, not `rerouteCooldown` from
+            // when this one started. A success keeps the full cooldown.
+            lastRerouteAt = Date.now.addingTimeInterval(rerouteRetryAfterFailure - rerouteCooldown)
+            log.warning("Reroute failed — keeping existing route, will retry in \(Int(self.rerouteRetryAfterFailure)) s")
+        }
+    }
+
+    /// Swap `activeRoute` to `newRoute` and rebuild every piece of
+    /// per-route display/geometry state — shared by the off-route
+    /// reroute path AND the live-traffic reroute path. Resets the
+    /// segment cursor + off-route state, reseeds the maneuver model to
+    /// the fresh route's first steps (same off-by-one-safe shape as
+    /// `seed`), refreshes the overview caches, folds the new route's
+    /// `expectedTravelTime` into `legArrivalDate` (a swap IS itself an
+    /// Apple re-fetch), and fires `onActiveRouteChanged` so the tile
+    /// cache re-bakes and the dash/Map repaint the new blue line. The
+    /// travelled breadcrumb is deliberately untouched — a swap replaces
+    /// the road AHEAD, never the ground already covered.
+    private func installSwappedRoute(_ newRoute: MKRoute) async {
+        routeRecalculations += 1
+        self.activeRoute = newRoute
+        self.lastSegmentIndex = 0
+        self.offRouteSince = nil
+        self.isOffRoute = false
+        self.remainingDistance = newRoute.distance
+        self.legArrivalDate = Date(timeIntervalSinceNow: newRoute.expectedTravelTime)
+        self.stepBeforeNext = newRoute.steps.first        // arriving (text + incoming leg)
+        self.nextStep = newRoute.steps.dropFirst().first  // departing (outgoing leg)
+        self.precedingStep = nil                          // fresh route → nothing before
+        self.distanceToNextStep = newRoute.steps.first?.distance ?? 0
+        self.secondNextStep = newRoute.steps.dropFirst(2).first
+        self.distanceToSecondNextStep = (newRoute.steps.first?.distance ?? 0)
+            + (newRoute.steps.dropFirst().first?.distance ?? 0)
+        // Sync the plan's CURRENT leg to the new road BEFORE firing the
+        // hook. The route-changed hook rebuilds the whole-trip blue line
+        // from `plan`; if the plan still holds the pre-reroute leg, the
+        // hook repaints the old road the rider already left and no line
+        // shows along the road they're on now. Single-destination nav
+        // (plan == nil) relies on `setRoutePolyline(newRoute.polyline)`
+        // in the hook instead — nothing to sync.
+        if let plan, plan.legs.indices.contains(currentLegIndex) {
+            plan.replaceLegRoute(legIndex: currentLegIndex, with: newRoute)
+        }
+        refreshOverviewCaches()
+        // A reroute can replace the leg the borrowed step came from, so
+        // re-derive it rather than letting a step from the abandoned route
+        // classify the next boundary.
+        refreshNextLegFirstStep()
+        await onActiveRouteChanged?(newRoute)
+    }
+
+    // MARK: - Leg advance (multi-stop)
+
+    /// Switch from the current leg to the next one. Reuses `seed(...)`
+    /// to reset all display/geometry state, then fires the same
+    /// `onActiveRouteChanged` hook reroute uses — so the polyline swap
+    /// and tile re-bake are already wired for free. Called from
+    /// `ingest(fix:)` when the rider reaches an intermediate waypoint.
+    private func advanceToNextLeg(in plan: PlannedRoute) async {
+        let next = currentLegIndex + 1
+        guard plan.legs.indices.contains(next) else { return }
+        let leg = plan.legs[next]
+        guard let route = leg.selected?.route,
+              let destWp = plan.waypoint(id: leg.toWaypointId) else {
+            log.error("Leg advance \(self.currentLegIndex)→\(next): next leg has no selected route — staying put")
+            return
+        }
+        log.info("Leg advance \(self.currentLegIndex + 1)→\(next + 1) of \(plan.legs.count) — now to \(destWp.name, privacy: .public)")
+        currentLegIndex = next
+        remainingWaypoints = plan.legs.count - next
+        // seed() reseeds `legArrivalDate` from the NEW leg's own fresh
+        // `expectedTravelTime` and restarts the periodic re-fetch pump —
+        // same as a brand-new `start()`, just without flipping
+        // `isNavigating` (already true) or firing `onActiveRouteChanged`
+        // (the caller below does that once seed() returns).
+        seed(route: route, destination: destWp.asDestination)
+        await onActiveRouteChanged?(route)
+    }
+
+    // MARK: - Manual leg skip (dash "remove waypoint" button)
+
+    /// Skip the CURRENT leg's end waypoint and jump straight to the next
+    /// leg — the dash's in-menu "remove waypoint" action (button `0x20`).
+    /// Mirrors the automatic `advanceToNextLeg` used on arrival, but is
+    /// rider-initiated: it drops the upcoming intermediate stop and routes
+    /// to the one after it.
+    ///
+    /// Returns `true` if a leg was skipped. Returns `false` (no-op) when
+    /// not plan-navigating or already on the final leg — there is no
+    /// intermediate waypoint left to remove, so the press is a safe no-op
+    /// (exit-nav is the separate `0x12` action for ending the whole ride).
+    @discardableResult
+    func skipCurrentLeg() async -> Bool {
+        guard isNavigating, let plan else {
+            log.info("skipCurrentLeg: not plan-navigating — ignored")
+            return false
+        }
+        // Only intermediate legs can be skipped; the last leg's waypoint is
+        // the final destination (use exit-nav to end the ride instead).
+        guard currentLegIndex + 1 < plan.legs.count else {
+            log.info("skipCurrentLeg: already on the final leg — nothing to remove")
+            return false
+        }
+        log.info("skipCurrentLeg: rider removed waypoint at leg \(self.currentLegIndex + 1) of \(plan.legs.count)")
+        // Mid-leg swap the rider triggers: the next leg can turn off the
+        // average-speed section, so end it like any other recalculation.
+        routeRecalculations += 1
+        await advanceToNextLeg(in: plan)
+        return true
+    }
+
+    // MARK: - Mid-ride route edit (phone "Edit route" sheet)
+
+    /// Swap the running navigation onto `newPlan` — the rider's edited
+    /// stops, with the live position as waypoint 0 — WITHOUT ending the
+    /// ride. Unlike `start(plan:)`, the ride-level state stays: the
+    /// breadcrumb, `hasBeenUnderway`, `rideStartCoordinate` and
+    /// `isNavigating`, so the stream, ride stats and the dash projection
+    /// carry on. Re-seeds from leg 0 and fires `onActiveRouteChanged` like
+    /// `advanceToNextLeg`, so polyline, tiles, full-route line, cameras and
+    /// limits follow as after a reroute; the ETA pump, alternatives and
+    /// overview restart in `seed`.
+    ///
+    /// Returns `false` (nothing changed) when not navigating, already
+    /// arrived, mid-reroute (its late result would be installed onto the
+    /// new plan's leg 0 with the OLD destination), or `newPlan` has no
+    /// route for leg 0.
+    @discardableResult
+    func replacePlan(_ newPlan: PlannedRoute) async -> Bool {
+        guard isNavigating, plan != nil, !hasArrived, !isRerouting,
+              newPlan.isComputed,
+              let leg = newPlan.legs.first,
+              let route = leg.selected?.route,
+              let destWp = newPlan.waypoint(id: leg.toWaypointId) else {
+            log.info("replacePlan: not applicable — ignored")
+            return false
+        }
+        log.info("replacePlan: \(newPlan.legs.count) leg(s), now to \(destWp.name, privacy: .public)")
+        // Read against the OLD plan, before it's swapped: the progress bar
+        // keeps what was already ridden, and the Live Activity retitles
+        // only when the final stop actually changed.
+        let covered = plannedTotalDistance - finalDestinationRemainingDistance
+        if let newFinal = newPlan.waypoints.last,
+           newFinal.id != plan?.waypoints.last?.id {
+            self.editedDestinationName = newFinal.name
+        }
+        self.plan = newPlan
+        self.currentLegIndex = 0
+        self.remainingWaypoints = newPlan.legs.count
+        // The final destination may have changed: re-arm its capture zone
+        // from scratch so a closest approach to the OLD one can't count.
+        self.arrivalArmed = false
+        self.minRemainingSinceArmed = .greatestFiniteMagnitude
+        self.stationaryInRadiusSince = nil
+        // Ends an average-speed section like any other recalculation.
+        routeRecalculations += 1
+        setProgressBaseline(plan: newPlan, fromLegIndex: 0, alreadyCovered: covered)
+        seed(route: route, destination: destWp.asDestination)
+        await onActiveRouteChanged?(route)
+        return true
+    }
+
+    // MARK: - ETA refresh (F6 — periodic Apple re-fetch)
+
+    /// (Re)start the periodic MKDirections re-fetch pump for the
+    /// CURRENT leg's ETA. Called from `seed()`, so it runs exactly once
+    /// per active-route swap (start / start-plan / leg-advance) — always
+    /// cancels any prior pump first, so there's never more than one
+    /// running. First beat is the sleep, not an immediate re-fetch:
+    /// `seed()` just set `legArrivalDate` from a brand-new `MKRoute` a
+    /// few lines above, so firing a re-fetch immediately would be a
+    /// redundant MKDirections call back-to-back with the one that
+    /// produced the route the rider is currently starting on.
+    private func startEtaRefreshLoop() {
+        etaRefreshTask?.cancel()
+        etaRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(self.etaRefreshInterval * 1_000_000_000))
+                if Task.isCancelled { break }
+                await self.refreshEtaFromApple()
+            }
+        }
+    }
+
+    /// Re-query MKDirections from the rider's current position to the
+    /// current leg's destination, and fold ONLY the fresh
+    /// `expectedTravelTime` into `legArrivalDate` — no polyline swap, no
+    /// `onActiveRouteChanged`, no tile re-bake, no touching
+    /// `isRerouting`. Deliberately narrower than `requestReroute`: the
+    /// rider is still ON the route (this isn't recovery from going
+    /// off-route), we just want Apple's latest traffic-aware
+    /// time-to-arrival. Reuses `onRerouteRequested` rather than adding a
+    /// second hook — see that property's doc-comment for why the shared
+    /// signature is a good fit — or, with live-traffic reroute on, the
+    /// alternate-set request that the traffic check needs anyway.
+    ///
+    /// No-ops quietly (leaves the existing countdown running
+    /// undisturbed) if we don't have a GPS fix yet, aren't navigating,
+    /// or the MKDirections call fails/throws — a missed refresh just
+    /// means the countdown free-runs on wall-clock a bit longer until
+    /// the next scheduled attempt `etaRefreshInterval` later. There's no
+    /// user-visible error path for a background ETA refresh; a reroute
+    /// (triggered separately by going off-route) would correct things
+    /// sooner anyway if the rider's actual position has drifted from plan.
+    private func refreshEtaFromApple() async {
+        // Not while a reroute is in flight: it is already asking Apple over
+        // the same (often weak) link, and its result resets the ETA anyway.
+        guard isNavigating,
+              !isRerouting,
+              let coord = currentCoordinate,
+              let dest = destination
+        else { return }
+        // Live-traffic reroute rides on the SAME periodic cadence and the
+        // SAME MKDirections call: with the opt-in setting on, one request
+        // for the alternate set serves both — `.first` (Apple's best) is
+        // the ETA, all of them feed the traffic decision. Off, the ETA
+        // uses the cheaper best-route-only hook.
+        if trafficRerouteEnabled, let traffic = onTrafficRoutesRequested {
+            // Taken before the ETA below is overwritten by `.first`, which
+            // may itself be the faster alternative.
+            let remainingEta = etaSeconds
+            let candidates = await traffic(coord, dest)
+            // `seed` (leg advance, replacePlan) cancelled this pump while
+            // Apple answered: these routes lead to the OLD destination.
+            guard !Task.isCancelled else { return }
+            if let best = candidates.first {
+                self.legArrivalDate = Date(timeIntervalSinceNow: best.expectedTravelTime)
+            }
+            await checkLiveTrafficReroute(candidates: candidates, remainingEta: remainingEta)
+        } else if let cb = onRerouteRequested,
+                  let route = await cb(coord, dest), !Task.isCancelled {
+            self.legArrivalDate = Date(timeIntervalSinceNow: route.expectedTravelTime)
+        }
+    }
+
+    // MARK: - Live-traffic reroute (feat/live-traffic-reroute)
+
+    /// Periodic live-traffic reroute check, fed Apple's current
+    /// traffic-aware alternatives from the rider's live position (fetched
+    /// by `refreshEtaFromApple`). Against the REMAINING time on the road
+    /// the rider is on, picks the fastest candidate that is a genuinely
+    /// different road ahead; if it saves at least
+    /// `trafficRerouteSavingSeconds`, swaps navigation onto it. Silent
+    /// (Martin 8/2026 chose automatic swap, like the off-route reroute).
+    ///
+    /// Conservative by design: no distinct + faster-by-threshold
+    /// candidate → no reroute (see `trafficRerouteDecision`). Respects the same
+    /// `rerouteCooldown` and `isRerouting` guards as the off-route path,
+    /// so the two reroute sources can't fire on top of each other.
+    private func checkLiveTrafficReroute(candidates: [MKRoute],
+                                         remainingEta: TimeInterval) async {
+        guard !isRerouting,
+              Date.now.timeIntervalSince(lastRerouteAt) >= rerouteCooldown,
+              !candidates.isEmpty,
+              !activeRouteCoordsCache.isEmpty else { return }
+
+        // Compare like with like: candidates are timed from the rider's
+        // position, so both the baseline and the distinctness check use the
+        // current leg AHEAD of the rider, never the whole installed route.
+        // (Whole-route time + whole-route geometry made a re-timed copy of
+        // the same road look like a distinct, far faster route once the
+        // rider was past 20 % of it.) Current leg only — the candidates
+        // end at this leg's destination.
+        let start = min(max(0, lastSegmentIndex), activeRouteCoordsCache.count - 1)
+        let aheadCoords = Array(activeRouteCoordsCache[start...])
+        guard let decision = Self.trafficRerouteDecision(
+            fallbackRemainingTime: remainingEta,
+            candidates: candidates.map {
+                ($0, $0.expectedTravelTime, $0.polyline.coordinateList())
+            },
+            aheadCoords: aheadCoords,
+            savingThreshold: trafficRerouteSavingSeconds
+        ) else { return }
+
+        let best = candidates[decision.bestIndex]
+        log.info("Live-traffic reroute: saving \(Int(decision.savingSeconds)) s ≥ threshold \(Int(self.trafficRerouteSavingSeconds)) s — swapping to faster route")
+        isRerouting = true
+        defer { isRerouting = false }
+        lastRerouteAt = .now
+        await installSwappedRoute(best)
+    }
+
+    /// Pure decision core for the live-traffic reroute — no MapKit calls,
+    /// no actor state, fully deterministic so it can be unit-tested and
+    /// mirrored in Python (`tools/fake_dash/tests`). Given the current
+    /// route AHEAD of the rider and a set of candidate (route, time,
+    /// coords) tuples — all timed from the rider's live position — decide
+    /// whether to swap and to which candidate.
+    ///
+    /// Baseline = the REMAINING time on the current road: the time Apple
+    /// just gave a candidate that is the same road ahead (non-distinct;
+    /// the fastest if several), else `fallbackRemainingTime` (the live
+    /// countdown). Never the installed route's whole-trip time — that
+    /// includes the part already ridden, so any re-timed candidate would
+    /// look like a big saving.
+    ///
+    /// Returns `nil` (DON'T reroute) when:
+    ///   - no candidate is geometrically DISTINCT from the road ahead
+    ///     (all just re-timings of the same road → nothing to switch to);
+    ///   - the fastest DISTINCT candidate doesn't beat the baseline by at
+    ///     least `savingThreshold`;
+    ///   - the baseline itself is non-finite / non-positive (bad input).
+    ///
+    /// "Distinct" = the candidate's mid-route geometry diverges from the
+    /// road ahead by more than `distinctThresholdMeters` at some
+    /// sampled point — a real different road, not GPS/decimation jitter on
+    /// the same one. This is what stops the check from "rerouting" onto an
+    /// identical road that Apple merely re-timed 6 minutes faster because
+    /// traffic eased (which would needlessly re-bake tiles + flash the
+    /// dash for no actual path change).
+    static func trafficRerouteDecision(
+        fallbackRemainingTime: TimeInterval,
+        candidates: [(route: MKRoute, time: TimeInterval, coords: [CLLocationCoordinate2D])],
+        aheadCoords: [CLLocationCoordinate2D],
+        savingThreshold: TimeInterval,
+        distinctThresholdMeters: CLLocationDistance = 120
+    ) -> (bestIndex: Int, savingSeconds: TimeInterval)? {
+        var sameRoadTime: TimeInterval? = nil
+        var distinct: [Int] = []
+        for (i, cand) in candidates.enumerated() {
+            guard cand.time.isFinite, cand.time > 0 else { continue }
+            if routesAreDistinct(aheadCoords, cand.coords,
+                                 thresholdMeters: distinctThresholdMeters) {
+                distinct.append(i)
+            } else {
+                sameRoadTime = min(sameRoadTime ?? cand.time, cand.time)
+            }
+        }
+        let baseline = sameRoadTime ?? fallbackRemainingTime
+        guard baseline.isFinite, baseline > 0 else { return nil }
+
+        var bestIdx: Int? = nil
+        var bestTime = baseline - savingThreshold  // must beat this
+        // Only candidates that are a genuinely different road.
+        for i in distinct where candidates[i].time < bestTime {
+            bestTime = candidates[i].time
+            bestIdx = i
+        }
+        guard let idx = bestIdx else { return nil }
+        return (idx, baseline - candidates[idx].time)
+    }
+
+    /// True if two coordinate paths represent DIFFERENT roads — i.e. at
+    /// some sampled fraction along path A, the nearest point on path B is
+    /// farther than `thresholdMeters`. Samples A at a handful of interior
+    /// fractions (skips the shared start/end, which always coincide for
+    /// same-origin/same-destination routes) and asks how far B strays.
+    /// Cheap O(samples × |B|); both paths are decimated route polylines.
+    static func routesAreDistinct(_ a: [CLLocationCoordinate2D],
+                                  _ b: [CLLocationCoordinate2D],
+                                  thresholdMeters: CLLocationDistance) -> Bool {
+        guard a.count >= 2, b.count >= 2 else { return false }
+        // Interior sample fractions — avoid 0 and 1 (shared endpoints).
+        let fractions = [0.2, 0.35, 0.5, 0.65, 0.8]
+        for f in fractions {
+            let idx = min(a.count - 1, max(0, Int(Double(a.count - 1) * f)))
+            let p = a[idx]
+            // Nearest distance from p to any vertex of b (vertex-level is
+            // enough at 120 m threshold on decimated polylines).
+            var nearest = CLLocationDistance.greatestFiniteMagnitude
+            for q in b {
+                let d = PolylineMath.haversine(p, q)
+                if d < nearest { nearest = d }
+                if nearest <= thresholdMeters { break }
+            }
+            if nearest > thresholdMeters { return true }
+        }
+        return false
+    }
+
+    // MARK: - Formatting helpers
+
+    /// "320 m" under 1 km, "1.4 km" otherwise. Currently has no caller —
+    /// the HUD and the dash overlay use their own unit-aware formatters.
+    static func formatDistance(_ meters: CLLocationDistance) -> String {
+        if meters < 1000 {
+            return "\(Int(meters.rounded())) m"
+        }
+        return String(format: "%.1f km", meters / 1000)
+    }
+}
+
+// NOTE: The legacy `ManeuverGlyph.symbol(for:)` SF-symbol picker was
+// removed here. It NLP-classified the instruction string with the same
+// substring approach (and the same left-before-right / road-name bug)
+// that this change replaced. The single source of truth is now
+// `ManeuverKind.classify(arrivingStep:departingStep:precedingStep:)` →
+// `ManeuverKind.sfSymbol`
+// (geometry for direction, text for family), used by both the dash
+// bubble and the SwiftUI HUD.

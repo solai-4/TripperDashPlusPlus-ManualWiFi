@@ -1,0 +1,691 @@
+"""
+Tests for the reroute → polyline-swap → tile-rebake lifecycle, as
+implemented in:
+
+  - TripperDashPP/Navigation/ActiveNavigator.swift
+    (`onActiveRouteChanged` callback fires on start() AND reroute)
+  - TripperDashPP/UI/MapPickerView.swift
+    (hook installs polyline immediately, schedules tile bake)
+  - TripperDashPP/Map/MapViewSource.swift
+    (`scheduleTileCacheRebuild` bakes immediately in EVERY app state —
+    the bake is BG-safe URLSession + CGContext since the OSM migration —
+    and coalesces overlapping reroutes to the latest via
+    `pendingRebakeInFlight`)
+
+This file is a Python mirror of the Swift state machine — pinning
+the behaviour so a future refactor that re-introduces an
+`applicationState == .active` gate on the reroute bake is caught
+immediately. The Swift unit tests would need XCTest + a UIApplication
+mock; this is a lot cheaper.
+
+## History (why this file was rewritten)
+
+An earlier version of these tests asserted the OPPOSITE invariant:
+that a reroute in `.background` must DEFER its tile bake to
+`didBecomeActiveNotification`, "because MKMapSnapshotter is GPU-bound
+and blocked in BG". That was true in the MKMapSnapshotter era, but the
+OSM tile migration (mid-2026) made the bake pure URLSession + CGContext,
+which is BG-safe. The `.active` gate then became a latent bug: a rider
+who took a wrong turn mid-ride (phone pocketed → app is `.background`
+the whole time) would get a reroute polyline but NO map ground under it
+— `drawVectorOnlyFrame` painting a bare route line on a blank Light
+canvas — for the rest of the trip, because the deferred bake never
+drained (the phone never returned to `.active`). Removing the gate is
+the fix; these tests were inverted to pin the corrected behaviour, the
+same way `test_tile_cache_style_isolation.py` was deleted when the
+share-one-cache invariant flipped. Keeping the old assertions would have
+pinned the bug.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# --- Minimal mirror of the relevant Swift state -----------------------------
+
+
+class AppState:
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+    BACKGROUND = "background"
+
+
+@dataclass
+class FakeMapViewSource:
+    """Mirrors the relevant fields/methods on Swift MapViewSource."""
+
+    app_state: str = AppState.ACTIVE
+    current_polyline_id: Optional[int] = None          # set_route_polyline
+    current_tile_cache_route_id: Optional[int] = None  # set_tile_cache
+    pending_rebake_route_id: Optional[int] = None
+    pending_rebake_in_flight: bool = False
+    current_route_id: Optional[int] = None             # currentRoute
+    bakes_executed: list[int] = field(default_factory=list)
+    style: str = "light"                                # currentStyle
+    installed_style: Optional[str] = None
+    # Set by a test to run a callback in the middle of the next bake (the
+    # bake is async on the main actor: stop / style / reroute can land).
+    during_bake: list = field(default_factory=list)
+
+    def set_current_route(self, route_id: Optional[int]) -> None:
+        # Mirror of Swift `setCurrentRoute`: also drops a queued rebake.
+        self.current_route_id = route_id
+        self.pending_rebake_route_id = None
+
+    restyles: list = field(default_factory=list)
+
+    def set_style(self, style: str) -> None:
+        # `setMapStyle` with a reroute bake in flight only records the
+        # palette; the reroute bake re-styles itself.
+        self.style = style
+        if not self.pending_rebake_in_flight:
+            self._restyle_current_route()
+
+    def _restyle_current_route(self) -> None:
+        # Mirror of `restyleCurrentRoute` → `performStyleRebake` (instant).
+        if self.current_route_id is None:
+            return
+        self.restyles.append((self.current_route_id, self.style))
+        self.set_tile_cache(self.current_route_id, self.style)
+
+    def set_route_polyline(self, route_id: int) -> None:
+        self.current_polyline_id = route_id
+
+    def set_tile_cache(self, route_id: Optional[int], style: Optional[str] = None) -> None:
+        self.current_tile_cache_route_id = route_id
+        self.installed_style = style
+
+    def schedule_tile_cache_rebuild(self, route_id: int) -> None:
+        # Mirror of Swift `scheduleTileCacheRebuild`: NO app-state gate.
+        # Record the requested route, then bake immediately — unless a
+        # bake is already running, in which case the in-flight bake will
+        # pick up this newer route when it finishes (coalescing).
+        # Idle + same route the picker already installed (ride start) →
+        # skip; mid-bake everything coalesces (newest wins).
+        if not self.pending_rebake_in_flight and route_id == self.current_route_id:
+            return
+        self.pending_rebake_route_id = route_id
+        if self.pending_rebake_in_flight:
+            return
+        self._perform_pending_rebake()
+
+    def _perform_pending_rebake(self) -> None:
+        # Mirror of Swift `performPendingRebake`: MUST run on main, but
+        # has NO `applicationState == .active` guard — the bake is
+        # BG-safe (URLSession + CGContext).
+        route_id = self.pending_rebake_route_id
+        if route_id is None:
+            return
+        self.pending_rebake_in_flight = True
+        self.current_route_id = route_id
+        baking_for = route_id
+        baked_style = self.style
+        # ... bake happens here; whatever lands meanwhile runs now ...
+        while self.during_bake:
+            self.during_bake.pop(0)()
+        self.bakes_executed.append(baking_for)
+        self.pending_rebake_in_flight = False
+        # Navigation ended / new ride: checked before any re-bake, which
+        # would set `current_route_id` again (review M1). A queued route that
+        # is the new ride's own start route is the picker's to bake.
+        if self.current_route_id != baking_for:
+            if self.pending_rebake_route_id == self.current_route_id:
+                self.pending_rebake_route_id = None
+            if self.pending_rebake_route_id is not None:
+                self._perform_pending_rebake()
+                return
+            # Review L-b: the palette switch left to this (now stale) bake.
+            if self.installed_style is not None and self.installed_style != self.style:
+                self._restyle_current_route()
+            return
+        if baked_style != self.style:
+            self._perform_pending_rebake()
+            return
+        # Mid-bake new reroute? Recurse with the latest.
+        if self.pending_rebake_route_id != baking_for:
+            self._perform_pending_rebake()
+            return
+        self.pending_rebake_route_id = None
+        self.set_tile_cache(baking_for, baked_style)
+
+    def picker_prerender_install(self, route_id: int) -> None:
+        """Mirror of `MapPickerView.prerenderRouteTiles` finishing its 8 km
+        ride-start bake: install only if the route is still current."""
+        if route_id != self.current_route_id:
+            return
+        self.set_tile_cache(route_id, self.style)
+
+    def did_become_active(self) -> None:
+        """Mirror of UIApplication.didBecomeActiveNotification handler.
+
+        Reroute bakes are NO LONGER deferred here (they fire immediately
+        in every state). This drain is a belt-and-braces safety net for a
+        `pendingRebakeRoute` that somehow outlived its bake Task.
+        """
+        self.app_state = AppState.ACTIVE
+        if self.pending_rebake_route_id is None or self.pending_rebake_in_flight:
+            return
+        self._perform_pending_rebake()
+
+
+# --- Initial install --------------------------------------------------------
+
+
+def test_initial_route_in_foreground_sets_both_polyline_and_cache():
+    src = FakeMapViewSource(app_state=AppState.ACTIVE)
+    src.set_route_polyline(1)
+    src.schedule_tile_cache_rebuild(1)
+    assert src.current_polyline_id == 1
+    assert src.current_tile_cache_route_id == 1
+    assert src.bakes_executed == [1]
+
+
+# --- Reroute in foreground --------------------------------------------------
+
+
+def test_reroute_in_foreground_replaces_polyline_and_cache_immediately():
+    src = FakeMapViewSource(app_state=AppState.ACTIVE)
+    src.set_route_polyline(1)
+    src.schedule_tile_cache_rebuild(1)
+    # Now a reroute lands.
+    src.set_route_polyline(2)
+    src.schedule_tile_cache_rebuild(2)
+    assert src.current_polyline_id == 2
+    assert src.current_tile_cache_route_id == 2
+    assert src.bakes_executed == [1, 2]
+
+
+# --- Reroute in background (THE regression guard) ---------------------------
+
+
+def test_reroute_in_background_bakes_immediately():
+    """THE bug guard. In BG/lock the reroute bake MUST still run — the
+    bake is BG-safe (URLSession + CGContext) since the OSM migration.
+
+    Regression this pins: an `applicationState == .active` gate here used
+    to defer the bake to `didBecomeActive`, which never arrives while the
+    phone is pocketed, so the dash showed the new route line on a blank
+    ground (drawVectorOnlyFrame) for the rest of the ride. If someone
+    re-adds that gate, this test goes red.
+    """
+    src = FakeMapViewSource(app_state=AppState.ACTIVE)
+    src.set_route_polyline(1)
+    src.schedule_tile_cache_rebuild(1)
+    # User pockets phone, app goes BG.
+    src.app_state = AppState.BACKGROUND
+    # Reroute happens while locked.
+    src.set_route_polyline(2)
+    src.schedule_tile_cache_rebuild(2)
+    # Polyline updated (visible on dash immediately) ...
+    assert src.current_polyline_id == 2
+    # ... AND the new corridor was baked right away, even in BG.
+    assert src.current_tile_cache_route_id == 2
+    assert src.bakes_executed == [1, 2]
+    assert src.pending_rebake_route_id is None
+
+
+def test_reroute_in_inactive_state_also_bakes_immediately():
+    """`.inactive` is the brief screen-locking transition. It must NOT
+    gate the bake either (it was lumped in with `.background` by the old
+    deferring guard)."""
+    src = FakeMapViewSource(app_state=AppState.INACTIVE)
+    src.set_tile_cache(1)
+    src.set_route_polyline(2)
+    src.schedule_tile_cache_rebuild(2)
+    assert src.current_tile_cache_route_id == 2
+    assert src.bakes_executed == [2]
+
+
+def test_bake_does_not_wait_for_app_to_become_active():
+    """Complement to the FG/BG pair: a bake scheduled in BG has already
+    run by the time the app becomes active, so did_become_active is a
+    no-op (nothing left pending)."""
+    src = FakeMapViewSource(app_state=AppState.BACKGROUND)
+    src.set_tile_cache(1)
+    src.set_route_polyline(2)
+    src.schedule_tile_cache_rebuild(2)
+    # Already baked — no waiting for foreground.
+    assert src.current_tile_cache_route_id == 2
+    assert src.bakes_executed == [2]
+    # Waking adds nothing.
+    src.did_become_active()
+    assert src.bakes_executed == [2]
+
+
+# --- Coalescing overlapping reroutes ----------------------------------------
+
+
+def test_reroute_while_bake_in_flight_coalesces_to_latest():
+    """Two reroutes where the second lands WHILE the first is baking →
+    only the latest corridor is kept. This is the coalescing path: a
+    30 s reroute cooldown plus a wandering rider can stack requests, and
+    we don't want to bake a route that's already stale.
+
+    Modelled by manually holding the first bake 'in flight' (the Swift
+    bake is an `await prerender`, i.e. genuinely concurrent) and landing
+    reroutes during it.
+    """
+    src = FakeMapViewSource(app_state=AppState.BACKGROUND)
+
+    original = src._perform_pending_rebake
+    call_count = {"n": 0}
+
+    def patched():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            baking_for = src.pending_rebake_route_id
+            assert baking_for == 2
+            src.pending_rebake_in_flight = True
+            src.bakes_executed.append(baking_for)
+            # Two more reroutes land during the (awaited) bake — each just
+            # updates pending and returns because in_flight is set.
+            src.schedule_tile_cache_rebuild(3)
+            src.schedule_tile_cache_rebuild(4)
+            assert src.bakes_executed == [2]  # 3 and 4 did NOT start a bake
+            src.pending_rebake_in_flight = False
+            # In-flight bake finishes, sees pending(4) != bakingFor(2),
+            # recurses with the latest.
+            original()
+            return
+        original()
+
+    src._perform_pending_rebake = patched  # type: ignore[method-assign]
+    src.schedule_tile_cache_rebuild(2)
+    assert src.bakes_executed == [2, 4]
+    assert src.current_tile_cache_route_id == 4
+    assert src.pending_rebake_route_id is None
+
+
+def test_second_reroute_after_bake_finished_bakes_again():
+    """Sanity: reroutes that DON'T overlap each bake normally (no
+    coalescing when the previous bake already finished)."""
+    src = FakeMapViewSource(app_state=AppState.BACKGROUND)
+    src.schedule_tile_cache_rebuild(2)
+    src.schedule_tile_cache_rebuild(3)
+    assert src.bakes_executed == [2, 3]
+    assert src.current_tile_cache_route_id == 3
+
+
+def test_ride_start_route_already_installed_is_not_rebaked():
+    """Ride start: the picker installs the route (`setCurrentRoute`) and
+    prerenders 8 km; the route-changed hook for that same route must not
+    start a second bake."""
+    src = FakeMapViewSource()
+    src.current_route_id = 1
+    src.schedule_tile_cache_rebuild(1)
+    assert src.bakes_executed == []
+    src.schedule_tile_cache_rebuild(2)   # a genuine reroute still bakes
+    assert src.bakes_executed == [2]
+
+
+def test_ride_start_prerender_finishing_after_reroute_keeps_new_route():
+    """Reroute Y lands during the picker's 8 km prerender of X. Y's short
+    bake installs first; X's prerender must not put X's tiles back."""
+    src = FakeMapViewSource()
+    src.current_route_id = 1                # picker installed X
+    src.schedule_tile_cache_rebuild(2)      # reroute Y bakes + installs
+    assert src.current_tile_cache_route_id == 2
+    src.picker_prerender_install(1)         # X's 8 km bake finishes late
+    assert src.current_tile_cache_route_id == 2
+
+
+def test_alternative_flip_flop_during_bake_ends_on_newest_route():
+    """X → Y → X while X is still baking. Mid-bake `currentRoute` is X,
+    so an idle-only skip would drop the second X and install Y's tiles
+    while the navigator rides X."""
+    src = FakeMapViewSource()
+    original = src._perform_pending_rebake
+    calls = {"n": 0}
+
+    def patched():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            baking_for = src.pending_rebake_route_id
+            src.pending_rebake_in_flight = True
+            src.current_route_id = baking_for
+            src.bakes_executed.append(baking_for)
+            src.schedule_tile_cache_rebuild(20)   # Y
+            src.schedule_tile_cache_rebuild(10)   # back to X (same object)
+            src.pending_rebake_in_flight = False
+            if src.pending_rebake_route_id != baking_for:
+                original()
+                return
+            src.pending_rebake_route_id = None
+            src.set_tile_cache(baking_for)
+            return
+        original()
+
+    src._perform_pending_rebake = patched  # type: ignore[method-assign]
+    src.schedule_tile_cache_rebuild(10)       # X
+    assert src.current_tile_cache_route_id == 10
+    assert src.current_route_id == 10
+    assert src.pending_rebake_route_id is None
+
+
+# --- Edge cases -------------------------------------------------------------
+
+
+def test_did_become_active_with_nothing_pending_is_noop():
+    src = FakeMapViewSource(app_state=AppState.BACKGROUND)
+    src.set_tile_cache(1)
+    src.did_become_active()
+    assert src.bakes_executed == []
+    assert src.current_tile_cache_route_id == 1
+
+
+def test_stray_pending_route_drains_on_activation():
+    """Belt-and-braces: if a bake Task were cancelled leaving a stray
+    `pendingRebakeRoute`, did_become_active mops it up. (Constructed
+    by hand — the normal path never leaves a stray.)"""
+    src = FakeMapViewSource(app_state=AppState.BACKGROUND)
+    src.set_tile_cache(1)
+    src.pending_rebake_route_id = 2  # simulate a cancelled-Task leftover
+    src.did_become_active()
+    assert src.bakes_executed == [2]
+    assert src.current_tile_cache_route_id == 2
+
+
+# --- Documented invariant ---------------------------------------------------
+
+
+def test_polyline_is_NEVER_held_back_by_app_state():
+    """The polyline path is pure CGContext drawing — it works in BG.
+    Verify by setting polyline in every state, always succeeds."""
+    for state in [AppState.ACTIVE, AppState.INACTIVE, AppState.BACKGROUND]:
+        src = FakeMapViewSource(app_state=state)
+        src.set_route_polyline(42)
+        assert src.current_polyline_id == 42, f"failed in state={state}"
+
+
+def test_tile_bake_is_NEVER_held_back_by_app_state():
+    """The tile bake is BG-safe (URLSession + CGContext) since the OSM
+    migration. Verify a reroute bakes in EVERY state — this is the whole
+    point of the fix."""
+    for state in [AppState.ACTIVE, AppState.INACTIVE, AppState.BACKGROUND]:
+        src = FakeMapViewSource(app_state=state)
+        src.schedule_tile_cache_rebuild(7)
+        assert src.bakes_executed == [7], f"failed in state={state}"
+        assert src.current_tile_cache_route_id == 7, f"failed in state={state}"
+
+
+def test_reroute_rebake_uses_short_fast_start_window():
+    """A mid-ride reroute re-bake must NOT bake the full 8 km start-of-ride
+    window in one block — it competes for the cellular link with the new
+    route fetch, and the tiles under the rider should land first. It bakes a short window and leaves the rest to the
+    rolling `extend(near:)` (capped per pass)."""
+    from pathlib import Path
+    from tests.swift_source import decl_body, strip_comments
+    app = Path(__file__).resolve().parents[3] / "TripperDashPP"
+    src = strip_comments((app / "Map/MapViewSource.swift").read_text(encoding="utf-8"))
+    cache = strip_comments((app / "Map/RouteTileCache.swift").read_text(encoding="utf-8"))
+    body = decl_body(src, "private func performPendingRebake(")
+    assert "bakeAheadMeters: Self.rerouteBakeAheadMeters" in body
+    assert "RouteTileCache(style: currentStyle)\n" not in body
+    short = float(src.split("static let rerouteBakeAheadMeters: CLLocationDistance = ")[1].split()[0])
+    full = float(cache.split("static let initialBakeAheadMeters: CLLocationDistance = ")[1].split()[0])
+    rolling = float(cache.split("static let rollingLookaheadMeters: CLLocationDistance = ")[1].split()[0])
+    # Short enough to be a real relief, long enough to cover the rider
+    # until the rolling extender (2 s throttle) catches up at 130 km/h.
+    assert short <= full / 4
+    assert short >= 130 / 3.6 * 30
+    assert short < rolling
+
+
+def test_reroute_rebake_bakes_around_rider_and_skips_sibling_layers():
+    """Mid-ride route change: bake around the rider (an alternative
+    auto-switch starts back at the leg start) and no sibling layer — the
+    fine z=16 layer is the heaviest bake, and coarse is built lazily on the
+    next zoom-out (see test_coarse_layer_is_lazy)."""
+    from pathlib import Path
+    from tests.swift_source import decl_body, strip_comments
+    app = Path(__file__).resolve().parents[3] / "TripperDashPP"
+    src = strip_comments((app / "Map/MapViewSource.swift").read_text(encoding="utf-8"))
+    body = decl_body(src, "private func performPendingRebake(")
+    assert "fresh.prerender(route: route, around: coord)" in body
+    assert "setTileCache(fresh, buildLayers: false)" in body
+    assert "buildFineLayer(" not in body
+    assert "RouteTileCache(" not in body.split("let fresh = RouteTileCache(", 1)[1]
+    # Ride start already bakes 8 km for the route the picker installed;
+    # the route-changed hook for that same route must not bake it again.
+    sched = decl_body(src, "func scheduleTileCacheRebuild(")
+    assert "guard pendingRebakeInFlight || route !== currentRoute" in sched
+
+
+def test_late_bakes_never_install_a_stale_route_or_palette():
+    """Swift side of the ordering guards: the ride-start prerender installs
+    only while its route is current; a reroute bake that outlived a
+    palette switch re-bakes instead of installing; a style re-bake that
+    outlived a reroute drops its result."""
+    from pathlib import Path
+    from tests.swift_source import decl_body, strip_comments
+    app = Path(__file__).resolve().parents[3] / "TripperDashPP"
+    picker = strip_comments((app / "UI/MapPickerView.swift").read_text(encoding="utf-8"))
+    src = strip_comments((app / "Map/MapViewSource.swift").read_text(encoding="utf-8"))
+    pre = decl_body(picker, "private func prerenderRouteTiles(")
+    early = "guard status.mapViewSource.isCurrentRoute(route) else { return }"
+    late = ("guard status.mapViewSource.isCurrentRoute(route),\n"
+            "              cache.style == status.mapViewSource.currentStyle else { return }")
+    assert pre.index(early) < pre.index("setTileCache(cache, buildLayers: false)")
+    # The late check must follow the bake (before it, it guards nothing).
+    assert pre.index("await cache.prerender(") < pre.index(late) \
+        < pre.index("setTileCache(cache, buildLayers: true)")
+    assert "currentRoute === route" in decl_body(src, "func isCurrentRoute(")
+    rebake = decl_body(src, "private func performPendingRebake(")
+    restyle = rebake.index("if fresh.style != currentStyle {")
+    newer = rebake.index("if let latest = pendingRebakeRoute, ObjectIdentifier(latest) != bakingFor {")
+    stale = rebake.index("guard currentRoute === route else {")
+    install = rebake.index("setTileCache(fresh, buildLayers: false)")
+    # Review M1: the "still navigating this route" check comes BEFORE both
+    # re-bake branches (they set `currentRoute` again).
+    assert rebake.rindex("await fresh.prerender(") < stale < restyle < newer < install
+    assert "await performPendingRebake()" in rebake[restyle:restyle + 200]
+    stale_branch = rebake[stale:restyle]
+    assert "if pendingRebakeRoute === currentRoute { pendingRebakeRoute = nil }" in stale_branch
+    assert "if pendingRebakeRoute != nil { await performPendingRebake(); return }" in stale_branch
+    assert ("if let cache = routeTileCache, cache.style != currentStyle { restyleCurrentRoute() }"
+            in stale_branch)
+    # setMapStyle and the stale branch share one restyle path.
+    assert "restyleCurrentRoute()" in decl_body(src, "func setMapStyle(")
+    restyle_fn = decl_body(src, "private func restyleCurrentRoute(")
+    assert "guard let route = currentRoute, let fix = lastFix else { return }" in restyle_fn
+    assert "guard !pendingRebakeInFlight else {" in restyle_fn
+    assert "performStyleRebake(" in restyle_fn
+    # Stop / free ride / ride start all clear the queued rebake.
+    set_route = decl_body(src, "func setCurrentRoute(")
+    assert "currentRoute = route" in set_route and "pendingRebakeRoute = nil" in set_route
+    style = decl_body(src, "private func performStyleRebake(")
+    assert "guard style == currentStyle, currentRoute === route else { return }" in style
+    # No parallel style bake while a reroute bake runs (it re-styles itself).
+    setstyle = decl_body(src, "private func restyleCurrentRoute(")
+    assert setstyle.index("guard !pendingRebakeInFlight else {") \
+        < setstyle.index("performStyleRebake(")
+    # Stop clears the route so a late bake can't install after it.
+    assert "setCurrentRoute(nil)" in decl_body(picker, "private func stopNavigation(")
+
+
+def test_coarse_layer_is_lazy():
+    """Review A1: the coarse z=13 layer is only selected below ~0.77× zoom,
+    which only a manual zoom-out reaches, yet it was ~70 % of the image work
+    after every route change. It is now built the first time the renderer
+    selects `.coarse` and finds it missing (one bake at a time, base drawn
+    meanwhile), under the same stale route/palette guards as every other
+    late install. Route changes and palette switches just drop it."""
+    from pathlib import Path
+    from tests.swift_source import decl_body, strip_comments
+    app = Path(__file__).resolve().parents[3] / "TripperDashPP"
+    src = strip_comments((app / "Map/MapViewSource.swift").read_text(encoding="utf-8"))
+    active = decl_body(src, "private func activeTileCache(")
+    coarse_case = active[active.index("case .coarse:"):active.index("case .base:")]
+    assert "ensureCoarseLayer()" in coarse_case
+    assert "return routeTileCache" in coarse_case
+    lazy = decl_body(src, "private func ensureCoarseLayer(")
+    assert "guard coarseTileCache == nil, !coarseBakeInFlight," in lazy
+    assert "!pendingRebakeInFlight," in lazy
+    assert "let route = currentRoute else { return }" in lazy
+    done = lazy.index("coarseBakeInFlight = false")
+    stale = lazy.index("guard style == currentStyle, currentRoute === route,")
+    install = lazy.index("coarseTileCache = coarse")
+    assert lazy.index("await coarse.prerender(") < done < stale < install
+    # The only coarse RouteTileCache in the file is the lazy one.
+    assert src.count("zoom: MapViewSource.coarseLayerZoom") == 1
+    assert "zoom: MapViewSource.coarseLayerZoom" in lazy
+    # Route change / palette switch drop it; the rolling extend only tops
+    # up a coarse layer that exists.
+    assert "coarseTileCache = nil" in decl_body(src, "func setTileCache(")
+    assert "coarseTileCache = nil" in decl_body(src, "private func performStyleRebake(")
+    extend = decl_body(src, "func extendTileCache(")
+    assert "let coarse = coarseTileCache" in extend and "if let coarse {" in extend
+    assert "ensureCoarseLayer" not in extend
+
+
+def test_style_rebake_uses_short_window_and_keeps_fine():
+    """Review A5: a palette switch re-bakes only the short window around the
+    rider (all raw tiles are on disk, so it's pure CPU, and with
+    Auto it lands the moment the rider unlocks the phone). The fine layer
+    is still rebuilt; coarse returns lazily."""
+    from pathlib import Path
+    from tests.swift_source import decl_body, strip_comments
+    app = Path(__file__).resolve().parents[3] / "TripperDashPP"
+    src = strip_comments((app / "Map/MapViewSource.swift").read_text(encoding="utf-8"))
+    style = decl_body(src, "private func performStyleRebake(")
+    assert "bakeAheadMeters: Self.rerouteBakeAheadMeters" in style
+    assert "fresh.prerender(route: route, around: coord)" in style
+    guard = style.index("guard style == currentStyle, currentRoute === route else { return }")
+    assert guard < style.index("buildFineLayer(route: route, around: coord)")
+
+
+# --- Late bakes after End / new ride (review M1) ---------------------------
+
+
+def _navigating_with_reroute_in_flight():
+    src = FakeMapViewSource(app_state=AppState.BACKGROUND)
+    src.set_current_route(1)
+    src.set_tile_cache(1, "light")
+    return src
+
+
+def test_end_then_palette_switch_mid_bake_does_not_resurrect_the_route():
+    """Review M1: End mid-reroute-bake, then Auto flips to Dark at dusk.
+    The old order re-baked for the palette first, which set
+    `currentRoute` back to the ended route and installed its tiles."""
+    src = _navigating_with_reroute_in_flight()
+
+    def end_ride_then_dusk():
+        src.set_current_route(None)      # stopNavigation / free ride
+        src.set_tile_cache(None)
+        src.set_style("dark")
+
+    src.during_bake.append(end_ride_then_dusk)
+    src.schedule_tile_cache_rebuild(2)
+    assert src.current_route_id is None
+    assert src.current_tile_cache_route_id is None
+    assert src.bakes_executed == [2]
+    assert src.pending_rebake_route_id is None
+    src.did_become_active()              # the drain has nothing to revive
+    assert src.current_route_id is None and src.bakes_executed == [2]
+
+
+def test_end_then_queued_reroute_mid_bake_is_dropped():
+    """A reroute queued mid-bake, then End: `setCurrentRoute(nil)` drops the
+    queued route too, so neither the recursion nor the didBecomeActive
+    drain bakes a ride that ended."""
+    src = _navigating_with_reroute_in_flight()
+
+    def reroute_then_end():
+        src.schedule_tile_cache_rebuild(3)   # coalesces (bake in flight)
+        src.set_current_route(None)
+        src.set_tile_cache(None)
+
+    src.during_bake.append(reroute_then_end)
+    src.schedule_tile_cache_rebuild(2)
+    assert src.current_route_id is None
+    assert src.current_tile_cache_route_id is None
+    assert src.bakes_executed == [2]
+    src.did_become_active()
+    assert src.bakes_executed == [2]
+
+
+def test_new_ride_mid_bake_keeps_the_new_ride_and_its_reroute():
+    """End + start a new ride while a reroute bake of the old one runs. The
+    old bake installs nothing; the new ride's start route is the picker's
+    prerender (not re-baked here); a reroute of the new ride, queued during
+    the old bake, still gets baked for the new ride."""
+    src = _navigating_with_reroute_in_flight()
+
+    def new_ride_with_reroute():
+        src.set_current_route(10)            # picker installRouteGeometrySync
+        src.schedule_tile_cache_rebuild(11)  # new ride reroutes, coalesces
+
+    src.during_bake.append(new_ride_with_reroute)
+    src.schedule_tile_cache_rebuild(2)
+    assert src.bakes_executed == [2, 11]
+    assert src.current_route_id == 11
+    assert src.current_tile_cache_route_id == 11
+
+    src2 = _navigating_with_reroute_in_flight()
+
+    def new_ride_only():
+        src2.set_current_route(10)
+        src2.schedule_tile_cache_rebuild(10)  # route-changed hook, same route
+
+    src2.during_bake.append(new_ride_only)
+    src2.schedule_tile_cache_rebuild(2)
+    assert src2.bakes_executed == [2]        # picker's prerender bakes 10
+    assert src2.current_route_id == 10
+    assert src2.current_tile_cache_route_id == 1  # untouched by the stale bake
+
+
+def test_palette_switch_mid_bake_still_rebakes_while_navigating():
+    src = _navigating_with_reroute_in_flight()
+    src.during_bake.append(lambda: src.set_style("dark"))
+    src.schedule_tile_cache_rebuild(2)
+    assert src.bakes_executed == [2, 2]
+    assert (src.current_tile_cache_route_id, src.installed_style) == (2, "dark")
+
+
+def test_new_ride_plus_dusk_during_stale_bake_ends_in_new_palette():
+    """Review L-b: End, start a new ride (picker installs its cache in the
+    current palette), then Auto flips to Dark, all inside one stale reroute
+    bake. `setMapStyle` leaves the switch to the in-flight bake; the stale
+    branch must redo it for the new ride, or it stays Light."""
+    src = _navigating_with_reroute_in_flight()
+
+    def end_new_ride_dusk():
+        src.set_current_route(None)
+        src.set_tile_cache(None)
+        src.set_current_route(10)
+        src.picker_prerender_install(10)     # early install, light
+        src.set_style("dark")                # bake in flight → deferred
+
+    src.during_bake.append(end_new_ride_dusk)
+    src.schedule_tile_cache_rebuild(2)
+    assert src.current_route_id == 10
+    assert (src.current_tile_cache_route_id, src.installed_style) == (10, "dark")
+    assert src.restyles == [(10, "dark")]
+
+
+def test_stale_bake_without_palette_change_does_not_restyle():
+    src = _navigating_with_reroute_in_flight()
+
+    def end_new_ride():
+        src.set_current_route(10)
+        src.picker_prerender_install(10)
+
+    src.during_bake.append(end_new_ride)
+    src.schedule_tile_cache_rebuild(2)
+    assert src.restyles == []
+    assert (src.current_tile_cache_route_id, src.installed_style) == (10, "light")
+
+
+def test_finish_arrival_clears_the_route_on_every_branch():
+    """Review L-a: the link-down arrival branch used to keep the finished
+    route current, so a late reroute bake installed it."""
+    from pathlib import Path
+    from tests.swift_source import decl_body, strip_comments
+    app = Path(__file__).resolve().parents[3] / "TripperDashPP"
+    picker = strip_comments((app / "UI/MapPickerView.swift").read_text(encoding="utf-8"))
+    arrive = decl_body(picker, "private func finishArrival(")
+    clear = arrive.index("status.mapViewSource.setCurrentRoute(nil)")
+    assert clear < arrive.index("if status.bikeLink.state == .connected")

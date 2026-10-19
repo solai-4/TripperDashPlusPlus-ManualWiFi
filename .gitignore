@@ -1,0 +1,122 @@
+# ----- macOS -----
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+
+# ----- Xcode -----
+## User settings
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+*.mode1v3
+*.mode2v3
+*.pbxuser
+*.perspectivev3
+
+## Build products
+build/
+DerivedData/
+*.o
+*.LinkFileList
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.xcarchive
+
+## Obj-C/Swift specific
+*.hmap
+
+## Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# ----- Swift Package Manager -----
+.swiftpm/
+.build/
+Packages/
+Package.pins
+Package.resolved
+*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+
+# ----- CocoaPods (we don't use it, but just in case) -----
+Pods/
+*.xcworkspace/xcuserdata/
+
+# ----- Carthage (not used) -----
+Carthage/Build/
+Carthage/Checkouts
+
+# ----- fastlane (future) -----
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# ----- Secrets (NEVER commit) -----
+*.xcconfig.local
+.netrc
+.env
+.env.local
+
+# ----- Python harness -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+*.egg
+
+# ----- IDEs / editors -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursorrules
+.aider*
+
+# ----- Hermes agent (local plans / notes — never push) -----
+.hermes/
+
+# ----- Logs / temp -----
+*.log
+tmp/
+temp/
+
+# ----- Captured test data -----
+captures/
+*.pcap
+*.h264
+*.mp4
+!docs/**/*.mp4
+
+# ----- fake_dash runtime artifacts -----
+tools/fake_dash/captures/
+tools/fake_dash/keys/
+docs/maneuver-glyphs/glyphs_old/
+
+# ----- ad-hoc research scratch (Reddit/forum scrapes for the engine-
+# noise investigation etc.) — these get dumped in the repo root during
+# research sessions and must never be committed. -----
+/guerilla_*.json
+/guerrilla_*.json
+/guerrilla450_*.json
+/himalayan_*.json
+/himalayan450_*.json
+/loving_it_*.json
+/search_*.json
+/sub_*.json

@@ -1,0 +1,3531 @@
+//
+//  MapViewSource.swift
+//  TripperDashPP
+//
+//  Phase 8d — Pre-rendered route tile cache as the BG frame source.
+//
+//  History:
+//  --------
+//  Phase 8b: live MKMapView.layer.render(in:) every frame. FAILS in BG —
+//            MapKit's Metal renderer is paused once the app is no longer
+//            .active, so layer.render returns black pixels.
+//
+//  Phase 8c: MKMapSnapshotter on a 1 Hz cache + dot overlay. FAILS in
+//            BG — the snapshotter completion handler is silently
+//            suspended on the lock screen too. Confirmed by telemetry.
+//
+//  Phase 8d (THIS): pre-render tiles ahead of the rider (OSM raster
+//            stitches via URLSession, BG-safe — see RouteTileCache),
+//            keep them PNG-encoded in memory, then
+//            in BG do CPU-only CGContext composition: crop a tile around
+//            the current fix, rotate to heading-up, draw the polyline,
+//            draw the user dot. CGContext is BG-safe.
+//
+//  Output:
+//  -------
+//  526×300 BGRA pixel buffer at 4 fps emitted to the encoder. The
+//  background CoreLocation wakelock keeps the encoder pipeline
+//  + Swift Concurrency executor alive on lock screen; the tile cache
+//  supplies the visual content. (PiP was the old keep-alive; removed in
+//  Phase 8d — the tile + CGContext path is BG-safe without it.)
+
+import CoreLocation
+import CoreMedia
+import CoreText
+import CoreVideo
+import MapKit
+import OSLog
+import QuartzCore
+import UIKit
+
+@MainActor
+final class MapViewSource: NSObject, FrameSource {
+
+    // MARK: - FrameSource contract
+
+    let frameSize = CGSize(width: 526, height: 300)
+    let targetFps = 4
+
+    // MARK: - State
+
+    private weak var locationService: LocationService?
+    private weak var activeNavigator: ActiveNavigator?
+    private let log = Logger(subsystem: "eu.kolaczek.tripperdashpp", category: "MapViewSource")
+
+    private var locationToken: UUID?
+    private var fixSubscription: LocationSubscription?
+    private var headingSubscription: LocationSubscription?
+    private var lastFix: Fix?
+
+    /// Effective heading used to rotate the rendered frame (degrees,
+    /// CW from north). Lerped per-tick toward `targetHeading`.
+    ///
+    /// Field-test 2026-06-21 confirmed: on a motorcycle the magnetic
+    /// compass is unusable — frame vibrations, the steel skeleton, the
+    /// ignition coil and bar-end LEDs all skew `CLHeading.trueHeading`
+    /// by tens of degrees, and the dash sometimes rotates backwards
+    /// when the rider is moving forward. The robust signal is
+    /// `CLLocation.course` (true GPS course over ground) — but that's
+    /// `-1` when stationary, so we fall back to the compass at low
+    /// speed.
+    private var lastHeading: CLLocationDirection = 0
+
+    /// Smoothed target for `lastHeading`. Computed in `recomputeHeading()`
+    /// from the latest fix + compass; the render tick lerps toward it.
+    private var targetHeading: CLLocationDirection = 0
+
+    /// Last raw compass reading (kept around so we can fall back to it
+    /// when the bike stops at a light).
+    private var lastCompassHeading: CLLocationDirection = 0
+    private var lastCompassValid: Bool = false
+
+    private let queue = DispatchQueue(label: "TripperDashPP.MapViewSource", qos: .userInitiated)
+    private var renderTask: Task<Void, Never>?
+    private var frameIndex: UInt64 = 0
+    /// Consecutive ticks that produced no frame (stall diagnostics).
+    private var framesMissed = 0
+    private var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
+
+    // MARK: - Fixed frame cadence
+    //
+    // The render Task ticks at `targetFps` (4 Hz) and emits EVERY tick —
+    // CGContext composite → VideoToolbox encode → RTP send, plus the
+    // per-frame projection kick — including at a standstill. An earlier
+    // adaptive scheme (drop to 1 Hz + skip identical frames when parked)
+    // was removed on rider request: at 526×300 the idle battery saving was
+    // negligible and the dropped cadence occasionally read as a frozen
+    // picture. A fixed 4 fps (the stock app's rate) is simpler and looks
+    // consistently live; GPS position only moves ~1 Hz anyway.
+
+    /// Stream start on the same monotonic clock — PTS base so RTP 90 kHz
+    /// timestamps stay real-time-correct.
+    private var streamStartMediaTime: CFTimeInterval = 0
+
+    private var pixelBufferPool: CVPixelBufferPool?
+    private var routePolylineCoords: [CLLocationCoordinate2D] = []
+
+    /// The ENTIRE multi-stop route geometry (every leg's selected option,
+    /// concatenated) drawn as the blue line on the dash. Set once at
+    /// navigation start (and refreshed on reroute) so the rider sees the
+    /// whole trip, not just the polyline up to the next waypoint. When
+    /// non-empty this is what the route-line draw uses; when empty the
+    /// draw falls back to `routePolylineCoords` (the active leg only), so
+    /// single-destination / legacy paths keep working unchanged.
+    private var fullRouteCoords: [CLLocationCoordinate2D] = []
+
+    /// Intermediate waypoint coordinates (via-stops between origin and
+    /// final destination) rendered as upright blue pins on the route line.
+    /// Origin and final destination are intentionally excluded — the puck
+    /// marks the origin and the destination reads from the line's end.
+    private var waypointDots: [CLLocationCoordinate2D] = []
+
+    /// Thinned GPS breadcrumb of where the rider has ACTUALLY ridden, pushed
+    /// in by the nav pump from `ActiveNavigator.traveledCoordinates`. Drawn
+    /// as a grey line over the full blue route (under `routeAheadCoords`) so the covered stretch reads as
+    /// "done" while the road ahead stays blue. Empty on a fresh ride / when
+    /// not navigating. On an out-and-back over the same road the blue route
+    /// still occupies that segment, so painting grey first and blue second
+    /// lets the blue win the overlap (rider feedback, 8/2026).
+    private var traveledCoords: [CLLocationCoordinate2D] = []
+
+    /// Route still ahead of the rider (trimmed to current segment onward).
+    /// Painted blue OVER the grey travelled line so an out-and-back's upcoming
+    /// retrace of an already-ridden segment reads blue, not grey. Empty when
+    /// not navigating.
+    private var routeAheadCoords: [CLLocationCoordinate2D] = []
+
+    /// Alternative routes for the CURRENT leg, drawn thin/grey with an
+    /// ETA-delta bubble ("+5 min" / "similar"). The rider physically
+    /// turning onto one of these makes ActiveNavigator swap to it (see
+    /// `ActiveNavigator.maybeSwitchToAlternative`). Empty when there are no alternatives or
+    /// the setting is off. NOT the same as `fullRouteCoords` (the active
+    /// route) — these are the roads NOT currently being navigated.
+    fileprivate var alternativeRoutes: [AlternativeRouteRender] = []
+
+    /// Latest active-nav overlay state pushed in by ActiveNavLoop.
+    /// `nil` while not navigating → drawNavOverlay short-circuits.
+    fileprivate var navOverlayState: MapViewSource.NavOverlayState?
+
+    /// Latest ride-progress state pushed in by the nav pump. `nil` while
+    /// not navigating or when the feature is off → drawProgressBar
+    /// short-circuits (no bar drawn).
+    fileprivate var rideProgress: MapViewSource.RideProgress?
+
+    /// Latest ride-relevant weather alert, pushed in by the nav pump from
+    /// `WeatherAlertService`. `nil` → no pill drawn (clear weather, the
+    /// common case). Rendered bottom-right so it never overlaps the route
+    /// or the centred puck. See the "Ride-alerts overlay" extension below.
+    var weatherAlert: WeatherAlert?
+
+    /// Latest centred dash notice ("You've arrived", warnings, etc.) with the
+    /// wall-clock instant it expires. `nil` → nothing drawn. Set via
+    /// `showNotice(_:)`; the draw path clears it once `Date.now` passes the
+    /// expiry (time-based auto-dismiss, no background timer). See DashNotice.swift.
+    private var activeNotice: (notice: DashNotice, expiresAt: Date)?
+
+    /// Speed cameras to plot on the map, prefetched along the active route
+    /// by `SpeedCameraService`. Empty → nothing drawn. Each is rendered as
+    /// an upright camera pictograph at its geographic position (rotates
+    /// WITH the map for position, but the icon itself stays upright and
+    /// constant-size, like a proper POI marker).
+    var speedCameras: [SpeedCamera] = []
+
+    /// Speed-limit ways map-matched against the rider's position to derive
+    /// the posted limit for the current road. Fed by `AppStatus` after a
+    /// route install (same prefetch lifecycle as the cameras). Empty → no
+    /// sign. The map-match runs in `handleFix`, not per frame, so the
+    /// geometry loop happens at ~1 Hz GPS cadence, not 4 fps.
+    private var speedLimitWays: [SpeedLimitWay] = []
+
+    /// Bare drivable-road geometry (tagged or not) for the shadow guard:
+    /// lets the map-match notice when the rider is actually on a closer,
+    /// untagged road than the nearest tagged way and suppress a false limit
+    /// (e.g. a 90 tertiary shadowing the 50 residential you're really on).
+    private var speedLimitRoads: [RoadShape] = []
+
+    /// Spatial indexes over `speedLimitWays` / `speedLimitRoads`, built once
+    /// in `setSpeedLimits` so the per-fix match scans only the 3×3 cells
+    /// around the rider, not the whole route bbox (review B6).
+    private var speedLimitWayGrid: SegmentGrid?
+    private var speedLimitRoadGrid: SegmentGrid?
+
+    /// Bumped by every `setSpeedLimits`, so a slow off-main grid build never
+    /// installs over a newer route's data or a clear.
+    private var speedLimitInstallGeneration = 0
+
+    /// Whether no limit ways are currently loaded — lets `AppStatus` decide
+    /// if a mid-ride re-enable needs a backfill fetch.
+    var speedLimitWaysEmpty: Bool { speedLimitWays.isEmpty }
+
+    /// Currently map-matched posted limit (km/h), or `nil` when no way is
+    /// close enough. Derived in `handleFix`; read by `drawSpeedLimitSign`.
+    private var currentLimitKmh: Int?
+
+    /// Whether the rider is currently over `currentLimitKmh` by more than
+    /// the configured tolerance. Drives the `.overOnly` display mode.
+    private var isOverSpeedLimit: Bool = false
+
+    /// Display policy + tolerance + units for the limit sign, pushed from
+    /// settings (via `AppStatus` on prefetch and `ActiveNavLoop` per tick).
+    /// Stored as the raw enum string to avoid importing the settings type
+    /// into the renderer.
+    private var speedLimitMode: String = "always"   // off | always | overOnly
+    private var speedLimitToleranceKmh: Double = 3
+    private var speedLimitImperial: Bool = false
+
+    /// Units for the weather pill's along-route distance suffix ("Rain
+    /// 15 km" vs "Rain 9 mi"). Pushed alongside the alert from the nav
+    /// pump so it tracks the same `units` setting the speed labels use.
+    private var weatherImperial: Bool = false
+
+    /// Live average-speed section reading, or nil outside a section. Pushed
+    /// by the nav loop each tick; drawn by `drawSpeedSectionPanel`.
+    private var speedSection: SpeedSectionTracker.Reading?
+
+    /// Snap + hysteresis thresholds (m) for the map-match. A way must come
+    /// within `snapMeters` to ACQUIRE the limit; once shown, the sign holds
+    /// until the nearest way is further than `releaseMeters` away, so it
+    /// doesn't blink off in the gaps between tagged segments or when GPS
+    /// jitter nudges the match distance across a single threshold.
+    private static let limitSnapMeters: Double = 35
+    private static let limitReleaseMeters: Double = 80
+
+    /// Shadow guard thresholds. If the rider is sitting on a road that is
+    /// much closer than the nearest *tagged* way, they're on a different
+    /// (untagged) road and the tagged limit is a parallel-road artefact —
+    /// suppress it (better no sign than a wrong one). The match is rejected
+    /// only when BOTH hold: the closer road beats the tagged way by at
+    /// least `shadowAbsMeters` AND the tagged way is at least
+    /// `shadowRatio`× farther. Requiring both avoids nuking a legitimate
+    /// match where two roads merely run close together.
+    // `nonisolated` so `isShadowed` (a nonisolated static func mirrored 1:1 in
+    // the Python test) can read them under default MainActor isolation.
+    nonisolated private static let shadowAbsMeters: Double = 12
+    nonisolated private static let shadowRatio: Double = 2.0
+
+    /// Pre-rendered tile cache — built from the active route in FG.
+    /// This is the BASE layer (OSM z=15). Two optional sibling layers
+    /// give better quality at the extremes of the manual zoom range:
+    ///   - `coarseTileCache` (z=13): wide overview when zoomed way out,
+    ///     so the frame corners stay covered instead of going black.
+    ///   - `fineTileCache` (z=16): sharp streets when zoomed way in,
+    ///     instead of a blurry upscaled z=15 stitch.
+    /// The renderer is zoom-agnostic (it reads pxPerDeg from each tile),
+    /// so switching layer is purely a matter of which cache we ask for a
+    /// covering tile. `activeTileCache(for:)` picks the layer from the
+    /// current effective zoom with hysteresis to avoid boundary flicker.
+    private var routeTileCache: RouteTileCache?
+    private var coarseTileCache: RouteTileCache?
+    private var fineTileCache: RouteTileCache?
+
+    /// Which quality layer the renderer last selected. Sticky: switching
+    /// requires crossing the band edge PLUS a hysteresis margin, so a
+    /// zoom hovering on a threshold doesn't thrash between layers.
+    private var activeLayer: TileLayer = .base
+
+    /// OSM zoom levels for the three quality layers. All gridSides stay
+    /// ODD (Pitfall 11). Coarse trades detail for area; fine the reverse.
+    static let coarseLayerZoom = 13
+    static let baseLayerZoom = 15
+    static let fineLayerZoom = 16
+
+    enum TileLayer { case coarse, base, fine }
+
+    /// Pick the quality layer for an effective zoom (currentZoom ×
+    /// userZoomBias), with hysteresis around the band edges so a zoom
+    /// parked on a threshold doesn't flip-flop every frame. Falls back to
+    /// `.base` when the chosen sibling layer isn't baked yet.
+    private func selectLayer(forEffectiveZoom z: CGFloat) -> TileLayer {
+        // Nominal band edges. Chosen so each layer FULLY covers the dash
+        // frame across its whole band (verified in test_composite_coverage
+        // per layer): coarse z=13 covers the wide zoom-out AND overlaps up
+        // into the base band (base z=15 only fully covers the frame from
+        // ~0.77× out, so the coarse→base handoff sits at 0.85 where BOTH
+        // fine z=16 (gridSide 7) fully covers the frame from ~1.07× in
+        // (verified test_composite_coverage per layer), so its edge sits
+        // at 1.15 where base (covers to ~2.0×) still fully covers too.
+        // Set low (1.15) so the sharp z=16 streets are engaged for
+        // essentially all normal riding/standstill framing; base z=15
+        // only takes over on a deliberate wide zoom-out. Keeping the edge
+        // BELOW the resting autozoom band avoids a base/fine quality
+        // flicker when the zoom breathes around the handoff at standstill.
+        let coarseEdge: CGFloat = 0.85
+        let fineEdge: CGFloat = 1.15
+        let margin: CGFloat = 0.08   // hysteresis half-width
+
+        switch activeLayer {
+        case .coarse:
+            // Stay coarse until we climb well past the edge, OR the manual
+            // zoom-out that asked for coarse has fully reverted and base
+            // covers the frame again. Coarse only exists for the joystick
+            // zoom-out: autozoom alone never goes below 0.8, but above
+            // ~116 km/h it settles under the `coarseEdge + margin` exit
+            // (0.93), so without the neutral-bias exit a single LEFT press
+            // on a highway left the rider on 3-4x upscaled z=13 tiles
+            // ("roads like a splash of paint", field report 9/2026) until
+            // they zoomed back in. The hysteresis still holds while a
+            // manual bias is active, so the layer can't flicker then.
+            if z > coarseEdge + margin || (userZoomBias >= 1.0 && z >= coarseEdge - margin) {
+                activeLayer = (z >= fineEdge ? .fine : .base)
+            }
+        case .base:
+            if z < coarseEdge - margin { activeLayer = .coarse }
+            else if z > fineEdge + margin { activeLayer = .fine }
+        case .fine:
+            if z < fineEdge - margin { activeLayer = (z <= coarseEdge ? .coarse : .base) }
+        }
+        return activeLayer
+    }
+
+    /// The cache instance to render from for the current effective zoom.
+    /// Falls back to the base layer whenever the preferred sibling layer
+    /// hasn't been built yet (or its bake is still in flight), so the
+    /// rider never loses the map while a layer warms up.
+    private func activeTileCache(forEffectiveZoom z: CGFloat) -> RouteTileCache? {
+        switch selectLayer(forEffectiveZoom: z) {
+        case .coarse:
+            if let coarse = coarseTileCache { return coarse }
+            ensureCoarseLayer()
+            return routeTileCache
+        case .base:   return routeTileCache
+        case .fine:   return fineTileCache ?? routeTileCache
+        }
+    }
+
+    /// Current effective zoom for layer selection. `currentZoom` already
+    /// folds in the manual bias (it lerps toward `targetZoom = speedZoom ×
+    /// maneuverBoost × userZoomBias`), so we must NOT multiply by
+    /// userZoomBias again here — that would double-count the bias and pick
+    /// the wrong layer.
+    private var effectiveZoom: CGFloat { currentZoom }
+
+    private var lastTileHintIndex: Int = 0
+
+    /// Timestamp of the most recent `extendTileCache(near:)` invocation
+    /// that actually triggered work. Used to throttle the rolling
+    /// extender — GPS fixes arrive at ~1 Hz which is more often than
+    /// we want to re-evaluate the bake window.
+    private var lastTileExtendAt: Date?
+
+    /// Timestamp of the most recent `ensurePositionFallbackTile(near:)`
+    /// call. Throttles the off-corridor rescue-tile check the same way
+    /// `lastTileExtendAt` throttles the rolling window. Nil until the
+    /// first off-corridor frame.
+    private var lastPositionFallbackAt: Date?
+
+    /// Minimum interval between rolling-extend evaluations. At 130
+    /// km/h that's ~72 m between calls — fine granularity given the
+    /// rolling lookahead is 5 km.
+    private static let tileExtendThrottle: TimeInterval = 2.0
+
+    /// Fast-start window of a mid-ride re-bake: reroute
+    /// (`performPendingRebake`) and palette switch (`performStyleRebake`).
+    /// 2 km ahead + the 500 m trail ≈ 4 main anchors + wings (~12
+    /// composites vs ~36 for the 8 km start-of-ride window) — ~55 s of
+    /// road at 130 km/h, far more than the rolling extender needs to top
+    /// up the rest.
+    static let rerouteBakeAheadMeters: CLLocationDistance = 2000
+
+    /// Route queued for a fresh tile bake. Coalesces reroutes that land
+    /// while a bake is in flight (see `scheduleTileCacheRebuild`). Most
+    /// recent value wins — if a second reroute arrives before the
+    /// first bakes, the older route is discarded.
+    private var pendingRebakeRoute: MKRoute?
+    private var pendingRebakeInFlight: Bool = false
+    /// A lazy coarse-layer bake (`ensureCoarseLayer`) is running. One at a
+    /// time; the renderer asks again every frame while it wants coarse.
+    private var coarseBakeInFlight: Bool = false
+    private var appStateObserver: NSObjectProtocol?
+
+    /// The map palette the renderer is currently painting. Tile caches,
+    /// the void/vector fallback colours, and every fresh `RouteTileCache`
+    /// are bound to this. Changed only via `setMapStyle(_:)`.
+    private(set) var currentStyle: MapStyle = .light
+
+    /// The active route, remembered so a mid-ride style switch can re-bake
+    /// the new palette around the rider without the caller re-supplying it.
+    /// Set by `setCurrentRoute` / `performPendingRebake`; cleared on stop.
+    private var currentRoute: MKRoute?
+
+    /// A style re-bake that couldn't run yet (app backgrounded / locked).
+    /// Drained on `didBecomeActive`, same pattern as `pendingRebakeRoute`.
+    /// Most recent value wins.
+    private var pendingStyleRebake: (route: MKRoute, style: MapStyle)?
+    /// Speed-adaptive zoom factor applied to the rendered tile composite
+    /// and polyline. 1.0 = native scale (~3 m/px at z=15, 50°N).
+    /// Lerped each frame toward `targetZoom(forSpeed:)` so the view
+    /// transitions smoothly between speed regimes (no flicker).
+    private var currentZoom: CGFloat = 1.0
+
+    // MARK: - Manual zoom bias (dash LEFT/RIGHT buttons)
+
+    /// Rider-controlled multiplier layered ON TOP of the automatic
+    /// speed/maneuver zoom. RIGHT nudges it up (zoom in), LEFT down (zoom
+    /// out). The autozoom keeps breathing underneath — this only biases
+    /// its target — so the two cooperate instead of fighting. 1.0 = no
+    /// bias (pure autozoom). Clamped to `zoomBiasRange`.
+    private var userZoomBias: CGFloat = 1.0
+
+    /// Wall-clock time of the last manual zoom nudge. After
+    /// `zoomBiasHoldSeconds` of no input the bias eases back to 1.0 so the
+    /// map returns to fully-automatic framing on its own.
+    private var lastZoomBiasNudge: Date?
+
+    /// Multiplicative step per LEFT/RIGHT press (2× per nudge) so ONE press
+    /// is a big, obvious zoom change — riders found ~40% (1.4) a click-fest
+    /// when trying to zoom right out to see the next town(s). At 2.0 a
+    /// single press doubles/halves the bias; ~2 presses span most of the
+    /// range.
+    private let zoomBiasStep: CGFloat = 2.0
+    /// How far the rider can bias the autozoom in each direction. The
+    /// lower bound is deliberately generous (0.15) so a few LEFT presses
+    /// pull the map way out — far enough to see the next town or two on
+    /// the route. Affects ONLY the manual bias; the autozoom's own
+    /// 0.8–2.0 speed band is unchanged.
+    private let zoomBiasRange: ClosedRange<CGFloat> = 0.15...2.5
+    /// Idle time before the bias starts easing back to neutral.
+    private let zoomBiasHoldSeconds: TimeInterval = 15
+    /// Once easing starts, fraction of the way back to 1.0 per frame
+    /// (4 fps). Tuned per frame, so it must be rescaled if `targetFps`
+    /// changes: 0.06 at 4 fps ≈ the old 0.04 at 6 fps (~22% of the gap
+    /// closed per second either way).
+    private let zoomBiasRevertFactor: CGFloat = 0.06
+
+    /// A transient on-screen zoom indicator ("＋" / "－"), shown for a
+    /// moment after a manual nudge so the rider gets feedback that the
+    /// press registered. `atLimit` marks a press that couldn't move the
+    /// bias any further (already at the min/max clamp) so the OSD can draw
+    /// a "blocked" glyph instead. `nil` = nothing to draw.
+    private(set) var zoomOsd: (symbol: String, until: Date, atLimit: Bool)?
+
+    /// Apply a manual zoom nudge from the dash joystick. `zoomIn` true =
+    /// RIGHT (magnify), false = LEFT (widen). Bumps the bias one step,
+    /// clamps it, resets the auto-revert timer, and flashes the OSD. When
+    /// the bias is already pinned at the clamp and the rider keeps pressing
+    /// in the same direction, the OSD flashes a "blocked" glyph so it's
+    /// clear the zoom can't go any further.
+    /// Called on the main actor from AppStatus's button hook.
+    func applyZoomButton(zoomIn: Bool) {
+        let factor = zoomIn ? zoomBiasStep : 1.0 / zoomBiasStep
+        let before = userZoomBias
+        userZoomBias = min(max(userZoomBias * factor, zoomBiasRange.lowerBound),
+                           zoomBiasRange.upperBound)
+        // If the clamp swallowed the whole step, we were already at the
+        // limit — the press did nothing to the zoom. Use a small epsilon
+        // to absorb floating-point noise from the multiply.
+        let atLimit = abs(userZoomBias - before) < 1e-6
+        lastZoomBiasNudge = Date()
+        zoomOsd = (symbol: zoomIn ? "＋" : "－",
+                   until: Date().addingTimeInterval(1.2),
+                   atLimit: atLimit)
+        #if DEBUG
+        // Final stage of the button pipeline: confirm the zoom actually moved
+        // (or was clamped). If the console shows the BikeLink "routing to
+        // onButton" line but NOT this one, the hook wiring is the break; if it
+        // shows this but the dash view doesn't change, the bias→render path is.
+        log.info("BTN zoom: \(zoomIn ? "IN" : "OUT", privacy: .public) bias \(before, format: .fixed(precision: 3), privacy: .public) → \(self.userZoomBias, format: .fixed(precision: 3), privacy: .public)\(atLimit ? " (AT LIMIT, no change)" : "", privacy: .public)")
+        #endif
+    }
+
+    /// Ease the manual bias back toward 1.0 once the rider has stopped
+    /// nudging for `zoomBiasHoldSeconds`. Called once per frame from
+    /// `updateZoom()`. A no-op while the hold window is still open or the
+    /// bias is already neutral.
+    private func decayZoomBias() {
+        guard let nudged = lastZoomBiasNudge else { return }
+        guard Date().timeIntervalSince(nudged) >= zoomBiasHoldSeconds else { return }
+        if abs(userZoomBias - 1.0) < 0.01 {
+            userZoomBias = 1.0
+            lastZoomBiasNudge = nil
+            return
+        }
+        userZoomBias += (1.0 - userZoomBias) * zoomBiasRevertFactor
+    }
+
+    /// Vertical offset of the user puck from the geometric centre of
+    /// the frame, expressed as a fraction of the frame height. Positive
+    /// values push the puck *down* on the dash screen, which exposes
+    /// more map ahead of the rider. 0.0 = dead-center (legacy behaviour);
+    /// 0.28 ≈ puck at 78% from the top, 22% above the bottom edge.
+    ///
+    /// Authority: rider feedback from real-bike runs 2026-06 ("shift the
+    /// current position a bit lower toward the bottom edge", then "still
+    /// too high, push it further down so we see more ahead"). Capped at
+    /// ~0.30 — beyond that the puck feels like it's falling off the
+    /// bottom and the rider loses the sense of where they are.
+    private let forwardBiasFraction: CGFloat = 0.28
+
+    /// Scale factor for the user puck (blue dot + chevron). 1.0 = the
+    /// original 28 px ring. Bumped to make the rider's position pop more
+    /// against a busier, more-zoomed-in city map (2026-06 rider feedback:
+    /// "make the chevron a touch bigger so it's easier to spot"). Bumped
+    /// again 1.35 → 1.7 on a follow-up request to enlarge the position
+    /// chevron further so it's unmistakable at a glance on the bike dash.
+    private let puckScale: CGFloat = 1.7
+
+    /// On-screen thickness (px) of the drawn route polyline, held CONSTANT
+    /// across zoom levels. The line is stroked inside the `currentZoom`
+    /// scale, so each draw path divides this by `currentZoom` to cancel
+    /// the scale out. Bumped 5 → 7 px on rider feedback ("make the route a
+    /// bit thicker so it's easier to follow on the map") — still well under
+    /// the old fixed width 8 that rendered "as thick as the road" at city
+    /// zoom, but with a clearer, more legible track.
+    private let routeLineScreenPx: CGFloat = 7.0
+
+    /// On-screen width (px) of the dark/white casing stroked UNDER the
+    /// route line, both sides combined. Total casing width = routeLineScreenPx +
+    /// routeCasingScreenPx. Also divided by `currentZoom` at the draw site
+    /// so it stays constant on screen. 4.0 → ~2 px of casing peeking out
+    /// on each side of the blue line (rider feedback 2026-08: "obtáhnout
+    /// tenkou černou linkou aby víc vynikla").
+    private let routeCasingScreenPx: CGFloat = 4.0
+
+    /// PiP wrapper.
+    /// Phase 8d removed — tile cache + CGContext composite is BG-safe
+    /// without PiP. The background CoreLocation wakelock keeps the
+    /// process awake on lock screen.
+
+    init(locationService: LocationService, activeNavigator: ActiveNavigator) {
+        self.locationService = locationService
+        self.activeNavigator = activeNavigator
+        super.init()
+        installAppStateObserver()
+    }
+
+    deinit {
+        if let obs = appStateObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+    }
+
+    // MARK: - FrameSource
+
+    func start(onFrame: @escaping (CVPixelBuffer, CMTime) -> Void) {
+        self.onFrame = onFrame
+        self.frameIndex = 0
+        self.streamStartMediaTime = CACurrentMediaTime()
+        preparePool()
+        subscribeLocation()
+        startTimer()
+        log.info("MapViewSource started (prerendered tiles + CGContext, fixed \(self.targetFps) fps, \(Int(self.frameSize.width))x\(Int(self.frameSize.height)))")
+    }
+
+    func stop() {
+        renderTask?.cancel()
+        renderTask = nil
+        if let service = locationService, let token = locationToken {
+            service.stop(token: token)
+        }
+        locationToken = nil
+        fixSubscription = nil
+        headingSubscription = nil
+        onFrame = nil
+        log.info("MapViewSource stopped after \(self.frameIndex) frames")
+    }
+
+    // MARK: - Tile cache wiring
+
+    /// Install a pre-rendered tile cache produced by `RouteTileCache.prerender`.
+    /// Once installed, the BG render path will composite from these tiles
+    /// instead of asking MapKit to draw anything.
+    ///
+    /// When `buildLayers` is true and a route is known, this also kicks
+    /// off (fire-and-forget) the fine detail (z=16) sibling layer around
+    /// the rider's current position. The base layer is usable
+    /// immediately; fine appears a few seconds later once its (much
+    /// smaller) bake window finishes, and until then `activeTileCache`
+    /// transparently falls back to base. The coarse overview (z=13) is
+    /// never built here — only on demand, see `ensureCoarseLayer`.
+    func setTileCache(_ cache: RouteTileCache?, buildLayers: Bool = true) {
+        routeTileCache = cache
+        coarseTileCache = nil
+        fineTileCache = nil
+        activeLayer = .base
+        lastTileHintIndex = 0
+        lastTileExtendAt = nil
+        lastPositionFallbackAt = nil
+        log.info("Tile cache installed: \(cache?.tiles.count ?? 0, privacy: .public) tiles")
+        if buildLayers, cache != nil, let route = currentRoute {
+            buildFineLayer(route: route, around: lastFix?.coordinate)
+        }
+    }
+
+    /// Bake the coarse overview layer (z=13) the first time the renderer
+    /// selects `.coarse` and it is missing. Coarse is only picked below
+    /// ~0.77× zoom, which autozoom never reaches (floor 0.8) — only a
+    /// manual LEFT press does — yet it used to be ~70 % of the image work
+    /// after every route change. Until this bake lands, `activeTileCache`
+    /// draws base (black frame edges at the extreme zoom-out for a few
+    /// seconds). A route change or palette switch just drops the layer
+    /// (`setTileCache` / `performStyleRebake` set it to nil); the next
+    /// zoom-out rebuilds it for the current route and palette.
+    private func ensureCoarseLayer() {
+        guard coarseTileCache == nil, !coarseBakeInFlight,
+              routeTileCache != nil,
+              // A reroute bake drops the layers when it installs, so a
+              // coarse bake now would be thrown away.
+              !pendingRebakeInFlight,
+              let route = currentRoute else { return }
+        coarseBakeInFlight = true
+        let style = currentStyle
+        let coord = lastFix?.coordinate
+        let coarse = RouteTileCache(
+            style: style,
+            zoom: MapViewSource.coarseLayerZoom,
+            gridSide: 7,
+            bakeAheadMeters: 3000,
+            // A 7×7 z=13 composite spans ~22 km: 1400 m spacing and no wing
+            // rows still cover every heading (test_composite_coverage),
+            // at ~1/6 of the composites.
+            anchorStride: 1400,
+            bakesLateralRows: false
+        )
+        log.info("Coarse overview layer requested by zoom-out — baking")
+        Task { @MainActor in
+            if let coord {
+                await coarse.prerender(route: route, around: coord) { _ in }
+            } else {
+                await coarse.prerender(route: route) { _ in }
+            }
+            coarseBakeInFlight = false
+            // Same stale guards as every other late install: a palette
+            // switch or route change during the bake discards it.
+            guard style == currentStyle, currentRoute === route,
+                  coarseTileCache == nil else { return }
+            coarseTileCache = coarse
+            log.info("Coarse overview layer installed: \(coarse.tiles.count, privacy: .public) tiles")
+        }
+    }
+
+    /// Build the fine detail (z=16) sibling layer for `route`, baked
+    /// around `coord` (or the route start if nil), in its own Task, and
+    /// swap it in atomically. SHORT bake-ahead window: it only needs to
+    /// cover the immediate surroundings for its zoom band.
+    private func buildFineLayer(route: MKRoute, around coord: CLLocationCoordinate2D?) {
+        let style = currentStyle
+        let fine = RouteTileCache(
+            style: style,
+            zoom: MapViewSource.fineLayerZoom,
+            gridSide: 7,
+            bakeAheadMeters: 2000,
+            // Fine is only drawn zoomed in on the route; wing rows never
+            // won there (main-row preference). Base covers off-route.
+            // Spacing stays 700 m — 1400 m blacks out at the fine band edge.
+            bakesLateralRows: false
+        )
+        Task { @MainActor in
+            if let coord {
+                await fine.prerender(route: route, around: coord) { _ in }
+            } else {
+                await fine.prerender(route: route) { _ in }
+            }
+            guard style == currentStyle, currentRoute === route else { return }
+            fineTileCache = fine
+            log.info("Fine detail layer installed: \(fine.tiles.count, privacy: .public) tiles")
+        }
+    }
+
+    /// Remember the active route so a mid-ride style switch can re-bake
+    /// the new palette around the rider. Called by the picker right after
+    /// it builds the initial tile cache for `route`, and by the reroute
+    /// path. Pass nil when navigation stops.
+    /// Also drops any reroute bake queued for the previous route: stop, free
+    /// ride and ride start all come through here, and a queued route of a
+    /// ride that ended must never be baked (it would reinstall that ride).
+    func setCurrentRoute(_ route: MKRoute?) {
+        currentRoute = route
+        pendingRebakeRoute = nil
+    }
+
+    /// Whether `route` is still the route the renderer bakes for. The
+    /// picker's ride-start prerender checks this before installing, so a
+    /// reroute that landed mid-prerender keeps its own tiles.
+    func isCurrentRoute(_ route: MKRoute) -> Bool {
+        currentRoute === route
+    }
+
+    /// Switch the map palette (manual Light/Dark toggle, or Auto at
+    /// dusk/dawn). Builds a FRESH style-bound `RouteTileCache`, bakes the
+    /// fast-start window around the rider's current position, then swaps
+    /// it in — holding the OLD cache installed and visible until the new
+    /// bake's first batch lands, so the dash never flashes to the vector
+    /// fallback mid-switch. Deferred to `didBecomeActive` when the app is
+    /// backgrounded (the rider can't see the map on the lock screen, and
+    /// Auto flips are purely cosmetic, so there's nothing to lose).
+    func setMapStyle(_ style: MapStyle) {
+        guard style != currentStyle else { return }
+        currentStyle = style
+        log.info("Map style → \(style.tileCacheNamespace, privacy: .public)")
+        restyleCurrentRoute()
+    }
+
+    /// Re-bake the current route in `currentStyle` (or leave it to the
+    /// in-flight reroute bake / defer it to `didBecomeActive`).
+    private func restyleCurrentRoute() {
+        let style = currentStyle
+        // Not navigating yet: nothing to re-bake. The next prerender (when
+        // navigation starts) will pick up `currentStyle`. We still flip
+        // the vector-fallback colours immediately via currentStyle.
+        guard let route = currentRoute, let fix = lastFix else { return }
+
+        // A reroute bake in flight re-bakes itself in `currentStyle` when it
+        // finishes (see `performPendingRebake`); a parallel style bake would
+        // just double the CPU and network load right after a route change.
+        guard !pendingRebakeInFlight else {
+            log.info("Style re-bake left to the in-flight reroute bake")
+            return
+        }
+
+        guard UIApplication.shared.applicationState == .active else {
+            pendingStyleRebake = (route, style)
+            log.info("Style re-bake deferred — app not active; will run on didBecomeActive")
+            return
+        }
+        Task { @MainActor in await performStyleRebake(route: route, style: style, around: fix.coordinate) }
+    }
+
+    /// Bake `route` in `style` around `coord` and atomically swap the
+    /// cache. The previous cache stays installed (and visible) right up
+    /// until the reassignment, so there's no dark gap.
+    private func performStyleRebake(route: MKRoute, style: MapStyle, around coord: CLLocationCoordinate2D) async {
+        // The style may have changed again while we were waiting; bake the
+        // most recent requested style only.
+        guard style == currentStyle else { return }
+        // Short window around the rider, like a reroute: every raw tile is
+        // already on disk, so this is pure CPU (stitch, recolour, PNG
+        // encode; off the main actor) — and with Auto it runs the moment the rider unlocks
+        // the phone mid-ride. The rolling `extend(near:)` tops up the rest.
+        let fresh = RouteTileCache(style: style,
+                                   bakeAheadMeters: Self.rerouteBakeAheadMeters)
+        await fresh.prerender(route: route, around: coord) { _ in }
+        // Re-check: a newer style switch may have landed during the bake,
+        // or a reroute that now owns the renderer (its own bake already
+        // uses `currentStyle`).
+        guard style == currentStyle, currentRoute === route else { return }
+        routeTileCache = fresh   // atomic swap; old cache was visible until now
+        // Drop the old-palette sibling layers so they don't show a stale
+        // palette after a Light/Dark switch. Fine is rebuilt in the new
+        // style around the rider; coarse comes back lazily on the next
+        // zoom-out (`ensureCoarseLayer`).
+        coarseTileCache = nil
+        fineTileCache = nil
+        activeLayer = .base
+        lastTileHintIndex = 0
+        lastTileExtendAt = nil
+        lastPositionFallbackAt = nil
+        log.info("Style re-bake installed: \(style.tileCacheNamespace, privacy: .public), \(fresh.tiles.count, privacy: .public) tiles")
+        buildFineLayer(route: route, around: coord)
+    }
+
+    /// Extend the rolling tile-bake window around `coord`. Called from
+    /// `AppStatus.navigatorIngest` for every GPS fix. Throttled here
+    /// so the underlying URLSession isn't asked to re-evaluate the
+    /// rolling window faster than `tileExtendThrottle` (default 2 s).
+    ///
+    /// Idempotent: `RouteTileCache.extend` skips anchors already baked
+    /// or in flight, so calling more often than necessary is wasteful
+    /// but not incorrect. The throttle is for log noise + battery.
+    ///
+    /// Runs in `.background` too — and that is the WHOLE POINT. A
+    /// motorbike rider has the phone locked in a pocket for the entire
+    /// ride, so the app is `.background` the moment they pull away. The
+    /// bake is pure URLSession + CGContext (see
+    /// `ios-background-rendering-and-state-changes.md`): BG-safe, no GPU.
+    /// The old `applicationState == .active` guard meant the rolling
+    /// window NEVER extended in the only state that matters, so once the
+    /// fast-start window ran out (~8 km) the dash fell back to vector-only
+    /// for the rest of the trip — exactly the field report of "map tiles
+    /// vanished halfway, only the pre-cached ones showed" (Zvoleneves →
+    /// Terezín, 2026-06). Data/battery cost is bounded by the same
+    /// throttle + idempotent bake set; a usable map outweighs it.
+    func extendTileCache(near coord: CLLocationCoordinate2D) {
+        guard let cache = routeTileCache else { return }
+        let now = Date()
+        if let last = lastTileExtendAt,
+           now.timeIntervalSince(last) < Self.tileExtendThrottle {
+            return
+        }
+        lastTileExtendAt = now
+        // Extend the base layer plus whichever sibling quality layers are
+        // baked. Each cache's `extend` is idempotent + coalesced, so a
+        // sibling that isn't relevant to the current zoom still just keeps
+        // its rolling window warm cheaply (short bake-ahead window).
+        let coarse = coarseTileCache
+        let fine = fineTileCache
+        Task { @MainActor in
+            // Yield between layers as well as between individual tiles (see
+            // RouteTileCache.bakeAnchors). Each cache applies its own
+            // per-pass cap, so without a break here the three of them still
+            // run back-to-back as one long main-actor occupation — which is
+            // the shape that starved the stream on 2026-09-02.
+            await cache.extend(near: coord)
+            if let coarse {
+                await Task.yield()
+                await coarse.extend(near: coord)
+            }
+            if let fine {
+                await Task.yield()
+                await fine.extend(near: coord)
+            }
+        }
+    }
+
+    /// Ensure an off-corridor position-fallback tile is baked around the
+    /// rider. Throttled twin of `extendTileCache`, but for the rescue
+    /// tile used when the rider is OFF the route corridor entirely.
+    ///
+    /// Called only from `drawOffCorridorFallbackFrame`, i.e. only while
+    /// off-corridor — on-route it never fires, so it adds zero fetches to
+    /// normal navigation. The cache's `ensurePositionFallback` is itself
+    /// idempotent (no-op when a covering tile already exists) and coalesces
+    /// concurrent bakes; this throttle just caps how often we re-evaluate
+    /// so a stuck-off-route rider at 4 fps doesn't spin up the check
+    /// every frame. BG-safe (URLSession + CGContext), fire-and-forget.
+    func ensurePositionFallbackTile(near coord: CLLocationCoordinate2D) {
+        guard let cache = routeTileCache else { return }
+        let now = Date()
+        if let last = lastPositionFallbackAt,
+           now.timeIntervalSince(last) < Self.tileExtendThrottle {
+            return
+        }
+        lastPositionFallbackAt = now
+        Task { @MainActor in
+            await cache.ensurePositionFallback(near: coord)
+        }
+    }
+
+    /// Request a fresh tile cache for `route` (nav start, reroute, or
+    /// multi-stop leg advance). The bake runs immediately regardless of
+    /// app state, replacing the current cache when done. The OLD cache
+    /// stays installed and visible until the swap, so the dash never
+    /// flashes to the vector-only fallback mid-bake.
+    ///
+    /// This bakes in `.background` too — and that is the WHOLE POINT for
+    /// reroutes. Since the OSM migration the bake is pure URLSession +
+    /// CGContext (no `MKMapSnapshotter`/Metal — see `RouteTileCache.swift`
+    /// header), so it is BG-safe. A motorbike rider has the phone locked
+    /// in a pocket for the entire ride, so `.background` is the ONLY state
+    /// that ever runs mid-ride. The old `applicationState == .active` gate
+    /// meant a reroute corridor NEVER baked until the rider pulled the
+    /// phone out — leaving the dash on `drawVectorOnlyFrame` (bare route
+    /// line on a blank ground) for the rest of the trip after a single
+    /// wrong turn. Same lesson as the rolling `extendTileCache` guard
+    /// removed in PR #30: CPU/network ride-critical work must NOT gate on
+    /// `.active`; only cosmetic/GPU work (the Auto style re-bake) does.
+    ///
+    /// Calling twice quickly (e.g. two reroutes in 30 s) coalesces via
+    /// `pendingRebakeInFlight`: a reroute that lands mid-bake just updates
+    /// `pendingRebakeRoute`, and the in-flight bake re-runs with the
+    /// latest route when it finishes — only the newest corridor is kept.
+    func scheduleTileCacheRebuild(for route: MKRoute) {
+        // Ride start fires the route-changed hook for the route the picker
+        // already installed (`setCurrentRoute`) and is prerendering 8 km
+        // for (`prerenderRouteTiles`). A second bake of the same route
+        // would only race it on the stream-start main actor.
+        // Only when idle: mid-bake `currentRoute` is the route being baked,
+        // not the newest request, so an X → Y → X flip-flop between
+        // alternatives must go through the coalescing path (newest wins).
+        guard pendingRebakeInFlight || route !== currentRoute else {
+            log.info("Tile re-bake skipped — route already installed")
+            return
+        }
+        pendingRebakeRoute = route
+        if pendingRebakeInFlight {
+            // A bake is already running; it will pick up this newer route
+            // when it finishes (recursion in performPendingRebake). Don't
+            // start a second concurrent bake.
+            log.info("Tile re-bake requested while a bake is in flight — coalescing to latest")
+            return
+        }
+        log.info("Tile re-bake triggered (app state=\(UIApplication.shared.applicationState.rawValue, privacy: .public))")
+        Task { @MainActor in await performPendingRebake() }
+    }
+
+    /// Bake `pendingRebakeRoute` (if any) and atomically swap the
+    /// cache. MUST run on main. BG-safe (URLSession + CGContext) — no
+    /// app-state guard, by design (see `scheduleTileCacheRebuild`).
+    private func performPendingRebake() async {
+        guard let route = pendingRebakeRoute else { return }
+        // Take a local snapshot of the route id we're baking so we can
+        // tell whether a newer route landed mid-bake.
+        let bakingFor = ObjectIdentifier(route)
+        pendingRebakeInFlight = true
+        currentRoute = route
+        // Short fast-start window: a reroute happens mid-ride. The full
+        // 8 km start-of-ride window (~36 composites) is the heaviest bake of
+        // the ride, right when the phone is also fetching the new route over
+        // the same cellular link; the stitch runs off the main actor now,
+        // but the tiles under the rider should land first. The rolling
+        // `extend(near:)` tops the rest up to `rollingLookaheadMeters`, 12
+        // anchors per pass.
+        //
+        // Around the rider, not from the route start: an alternative
+        // auto-switch swaps in a route that starts back at the leg start,
+        // possibly km behind the rider (a reroute starts at the rider, so
+        // there it's the same window).
+        let fresh = RouteTileCache(style: currentStyle,
+                                   bakeAheadMeters: Self.rerouteBakeAheadMeters)
+        if let coord = lastFix?.coordinate {
+            await fresh.prerender(route: route, around: coord) { _ in }
+        } else {
+            await fresh.prerender(route: route) { _ in }
+        }
+        pendingRebakeInFlight = false
+        // Navigation ended (arrival → free ride, stop) or a new ride took
+        // over while we were baking: this corridor is no longer wanted.
+        // Checked BEFORE the re-bake branches below — they set
+        // `currentRoute` again, so running them first would bring a stopped
+        // route back (review M1: End mid-bake + a dusk palette switch).
+        // `setCurrentRoute` already dropped what was queued for the old
+        // ride; anything queued since is for the new ride. Its own start
+        // route is baked by the picker's prerender (same rule as the idle
+        // guard in `scheduleTileCacheRebuild`); only a reroute of it is ours.
+        guard currentRoute === route else {
+            if pendingRebakeRoute === currentRoute { pendingRebakeRoute = nil }
+            if pendingRebakeRoute != nil { await performPendingRebake(); return }
+            // `setMapStyle` left a palette switch to this bake, which is now
+            // stale: redo it for the route that took over (review L-b —
+            // End, new ride, dusk flip, all within one bake).
+            if let cache = routeTileCache, cache.style != currentStyle { restyleCurrentRoute() }
+            return
+        }
+        // If a newer route was scheduled while we were baking, throw
+        // this one away and recurse — fresh data wins. Same for a palette
+        // switch mid-bake: installing `fresh` would put the old palette
+        // back over the style re-bake (`pendingRebakeRoute` is still this
+        // route, so the recursion re-bakes it in `currentStyle`).
+        if fresh.style != currentStyle {
+            log.info("Map style changed during reroute bake — re-baking in the new palette")
+            await performPendingRebake()
+            return
+        }
+        if let latest = pendingRebakeRoute, ObjectIdentifier(latest) != bakingFor {
+            log.info("Newer reroute landed during bake — re-baking with latest")
+            await performPendingRebake()
+            return
+        }
+        pendingRebakeRoute = nil
+        // No sibling layers on a mid-ride route change. The fine z=16 layer
+        // is the heaviest bake (7×7 distinct tiles per composite): zoomed
+        // all the way in, the renderer falls back to the base z=15 layer.
+        // Coarse comes back lazily on the next zoom-out (`ensureCoarseLayer`).
+        // ponytail: fine layer returns only on the next style switch / ride
+        // start; bake it lazily later if riders miss the extra sharpness.
+        setTileCache(fresh, buildLayers: false)
+    }
+
+    /// Wire up the `didBecomeActiveNotification` observer that drains a
+    /// deferred STYLE re-bake when the user unlocks / returns to fg.
+    /// Called once from init.
+    ///
+    /// Note: reroute tile re-bakes are NO LONGER deferred here — since the
+    /// bake is BG-safe (URLSession + CGContext) they run immediately in
+    /// `scheduleTileCacheRebuild` regardless of app state. Only the Auto
+    /// style re-bake (cosmetic Light/Dark flip) is deferred to `.active`.
+    /// The reroute drain below is kept purely as a belt-and-braces net:
+    /// `performPendingRebake` is idempotent (no-ops when nothing pending),
+    /// so it harmlessly catches any `pendingRebakeRoute` that somehow
+    /// outlived its bake Task (e.g. a cancelled task).
+    private func installAppStateObserver() {
+        let center = NotificationCenter.default
+        appStateObserver = center.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // Registered with `queue: .main`, so this block always runs on the
+            // main thread. Under `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`
+            // the observer closure is nonisolated, so hop back onto the main
+            // actor explicitly to touch main-actor state (safe: main queue).
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // Drain a deferred style re-bake first (most recent style
+                // wins). This IS still deferred — it's cosmetic, so there's
+                // no point recolouring a map on the lock screen.
+                if let pending = self.pendingStyleRebake {
+                    self.pendingStyleRebake = nil
+                    if let fix = self.lastFix {
+                        self.log.info("App became active — draining pending style re-bake")
+                        Task { @MainActor in
+                            await self.performStyleRebake(route: pending.route,
+                                                          style: pending.style,
+                                                          around: fix.coordinate)
+                        }
+                    }
+                }
+                // Belt-and-braces: reroute bakes fire immediately now (even in
+                // BG), so this normally finds nothing. Kept as a safety net for
+                // a pendingRebakeRoute that outlived its bake Task.
+                guard self.pendingRebakeRoute != nil, !self.pendingRebakeInFlight else { return }
+                self.log.info("App became active — draining a stray pending tile re-bake")
+                Task { @MainActor in await self.performPendingRebake() }
+            }
+        }
+    }
+}
+
+// MARK: - Location wiring
+
+extension MapViewSource {
+    private func subscribeLocation() {
+        guard let service = locationService else { return }
+        locationToken = service.start(mode: .mapping)
+        fixSubscription = service.subscribeFixes { [weak self] fix in
+            Task { @MainActor in self?.handleFix(fix) }
+        }
+        headingSubscription = service.subscribeHeading { [weak self] heading in
+            Task { @MainActor in self?.handleHeading(heading) }
+        }
+    }
+
+    private func handleFix(_ fix: Fix) {
+        lastFix = fix
+        // The rider marker uses this fix directly.
+        //
+        // A MotionInterpolator used to sit here, dead-reckoning the displayed
+        // position between the ~1 Hz fixes so the marker moved at the
+        // render rate (then 6 fps). It was removed after the 2026-09-02 ride log showed it
+        // was the source of the map desyncing kilometres from the rider:
+        //
+        //   14:05:44  drift 1769 m      14:23:50  drift 3275 m
+        //   14:17:48  drift 5313 m      14:29:51  drift 3425 m
+        //
+        // GPS was healthy before every one of those (10 fixes per 10 s,
+        // backlog 0, hop 0 ms) — only 1 of the 8 snaps in that ride followed a
+        // CoreLocation outage, so this was not a GPS problem. The cause was
+        // `updateRouteFollowing`'s re-anchor:
+        //
+        //     routeProgressM = max(routeProgressM, proj.arcM)
+        //
+        // whose comment claimed "so drift can't accumulate", but which only
+        // corrected when the fix was AHEAD of the marker. Whenever the bike
+        // slowed relative to the extrapolation — lights, corners, traffic —
+        // the marker ran ahead and `max` locked that lead in permanently. The
+        // error was one-way and grew over minutes until it crossed the 100 m
+        // threshold and forced a hard-snap, which in turn made the tile cache
+        // bake a whole fresh window in one block and starved the stream.
+        //
+        // Dropping the interpolator removes the drift, the snaps, and that
+        // whole failure chain at the cost of a marker that steps at GPS rate.
+        recomputeHeading()
+        recomputeSpeedLimit(for: fix)
+    }
+
+    private func handleHeading(_ heading: Heading) {
+        // Stash the raw compass value — we'll use it as a fallback when
+        // the bike is stationary. We DON'T blindly drive the camera off
+        // it any more; see `recomputeHeading()` for the policy.
+        if heading.trueHeading >= 0 {
+            lastCompassHeading = heading.trueHeading
+            lastCompassValid = true
+        }
+        recomputeHeading()
+    }
+
+    /// Decide which heading to point the rendered frame at.
+    ///
+    /// Policy (field-test 2026-06-21):
+    ///   - `speed >= 3 m/s` (~11 km/h) AND `course >= 0` → trust GPS course
+    ///   - otherwise → fall back to the compass (last valid value)
+    ///   - lerp `lastHeading → targetHeading` in `updateHeading()` so the
+    ///     view doesn't snap when the source flips between course and
+    ///     compass.
+    ///
+    /// Why 3 m/s: below that the GPS course-over-ground is dominated by
+    /// fix jitter and swings wildly. Above it, the bike is definitely
+    /// moving and the course is the true direction of travel — robust
+    /// against any electromagnetic noise around the chassis.
+    private func recomputeHeading() {
+        let speedThresholdMPS: Double = 3.0  // ~11 km/h
+        var newTarget: CLLocationDirection = targetHeading
+
+        if let fix = lastFix,
+           fix.speed >= speedThresholdMPS,
+           fix.course >= 0 {
+            newTarget = fix.course
+        } else if lastCompassValid {
+            newTarget = lastCompassHeading
+        }
+
+        targetHeading = newTarget
+        // Seed `lastHeading` on the very first sample so the map doesn't
+        // do a 180° spin on startup.
+        if lastHeading == 0 && !lastCompassValid {
+            lastHeading = newTarget
+        }
+    }
+}
+
+// MARK: - Render tick
+
+extension MapViewSource {
+    /// Tick-to-tick gap that counts as a render stall (2 frame slots).
+    static let renderStallLogMs = 500
+
+    /// Render loop via Swift Concurrency Task + Task.sleep, on
+    /// `SuspendingClock` — in practice the same uptime base as
+    /// HeartbeatLoop's `Task.sleep(nanoseconds:)` (confirmed to keep ticking
+    /// on the locked screen under the CoreLocation wakelock) and as the
+    /// `CACurrentMediaTime` PTS.
+    ///
+    /// Sleeps until an absolute deadline on a fixed 1/targetFps grid, NOT
+    /// for a fixed interval after each tick. A relative sleep adds the
+    /// tick's own render time to every period: ~26 ms of work + 166.7 ms
+    /// of sleep gave 5.2 fps in the field (log 2026-09-28, 60 frames every
+    /// ~11.6 s).
+    ///
+    /// Two guards keep the dash from ever seeing a burst:
+    /// - a tick that overruns its slot skips the missed slots instead of
+    ///   catching up;
+    /// - the next tick never starts less than half an interval after the
+    ///   previous one ENDED (the frame goes to the encoder at the end of the
+    ///   tick), so two frames never reach the dash less than 125 ms apart
+    ///   (≤ 8 fps even for a single pair — the decoder blinks above
+    ///   ~12 fps). A slow or late tick is delayed, not dropped, so the rate
+    ///   degrades gradually under load; with ordinary few-ms jitter neither
+    ///   guard trips and the average is exactly targetFps.
+    private func startTimer() {
+        renderTask?.cancel()
+        let interval = Duration.seconds(1) / targetFps
+        renderTask = Task { [weak self] in
+            let clock = SuspendingClock()
+            var deadline = clock.now
+            var lastTickAt: SuspendingClock.Instant?
+            // `self != nil`: [weak self] alone would keep a loop whose
+            // source was freed ticking at 4 Hz (deinit can't cancel it).
+            while !Task.isCancelled, self != nil {
+                // Stall diagnostics: ticks start every 250 ms; > 500 ms
+                // means the render side itself froze (a long tick, or the
+                // main actor busy elsewhere), not GPS / encoder / the dash.
+                let tickAt = clock.now
+                if let lastTickAt {
+                    let gapMs = Int((tickAt - lastTickAt) / .milliseconds(1))
+                    if gapMs > Self.renderStallLogMs {
+                        self?.log.notice("render stall \(gapMs, privacy: .public) ms")
+                    }
+                }
+                lastTickAt = tickAt
+                await self?.tickOnMain()
+                deadline += interval
+                let now = clock.now
+                while deadline <= now { deadline += interval }
+                try? await Task.sleep(until: max(deadline, now + interval / 2), clock: clock)
+            }
+        }
+    }
+
+    private func tickOnMain() async {
+        guard onFrame != nil else { return }
+
+        // The rider marker follows raw GPS fixes directly. There used to be a
+        // MotionInterpolator here that dead-reckoned between the ~1 Hz fixes
+        // to give a per-frame marker; it was removed because it accumulated a
+        // one-way error that eventually had to be corrected with a visible
+        // hard-snap. See `handleFix` for the field evidence.
+        //
+        // Tradeoff, stated plainly: the marker now steps at GPS rate (~1 Hz)
+        // instead of gliding per frame. The map still renders at 4 fps, and
+        // heading/zoom still animate per tick below — only the position is
+        // no longer extrapolated between fixes.
+
+        // 1. Advance the per-tick animation state (heading + zoom lerps)
+        //    every tick (4 Hz) so an in-progress rotation/zoom dribbles
+        //    forward smoothly before we render.
+        updateHeading()
+        updateZoom()
+
+        // 2. Render + emit this tick unconditionally (fixed 4 fps).
+        let now = CACurrentMediaTime()
+
+        guard let buffer = renderMapViewToPixelBuffer() else {
+            // Otherwise a missing frame would show up only as an
+            // unexplained `rtp gap` and be blamed on the encoder. Once per
+            // run of failures, not 4× a second for the rest of the ride.
+            if framesMissed == 0 {
+                log.error("render produced no frame #\(self.frameIndex, privacy: .public)")
+            }
+            framesMissed += 1
+            return
+        }
+        if framesMissed > 0 {
+            log.notice("render frames back after \(self.framesMissed, privacy: .public) missed")
+            framesMissed = 0
+        }
+
+        // Real-time PTS from the monotonic clock (NOT frameIndex / fps) so
+        // the RTP 90 kHz timestamps stay wall-clock-correct — robust even
+        // if a tick is ever late under load.
+        let elapsed = max(0.0, now - streamStartMediaTime)
+        let pts = CMTime(seconds: elapsed, preferredTimescale: 90_000)
+        frameIndex &+= 1
+        if frameIndex % 60 == 0 {
+            let state = UIApplication.shared.applicationState.rawValue
+            log.info("frame tick #\(self.frameIndex, privacy: .public) (appState=\(state, privacy: .public))")
+        }
+        onFrame?(buffer, pts)
+    }
+
+    private func renderMapViewToPixelBuffer() -> CVPixelBuffer? {
+        guard let pool = pixelBufferPool else { return nil }
+        var pb: CVPixelBuffer?
+        let r = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb)
+        guard r == kCVReturnSuccess, let buffer = pb else { return nil }
+
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue |
+                         CGBitmapInfo.byteOrder32Little.rawValue
+
+        guard let ctx = CGContext(
+            data: base,
+            width: Int(frameSize.width),
+            height: Int(frameSize.height),
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else { return nil }
+
+        // Frame clear colour comes from the active style so the corners
+        // outside the rotated tile composite don't glare (near-black on
+        // both palettes; dark style is a touch cooler/darker).
+        ctx.setFillColor(currentStyle.voidColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: frameSize.width, height: frameSize.height))
+
+        // CGContext for CVPixelBuffer has origin at bottom-left;
+        // CALayer/UIImage expect top-left. Flip the Y axis once.
+        ctx.translateBy(x: 0, y: frameSize.height)
+        ctx.scaleBy(x: 1, y: -1)
+
+        // Unified FG + BG path: always composite from the pre-rendered
+        // tile cache (built when navigation starts) — works FG and BG
+        // since it's pure CGContext, no MapKit live render.
+        if routeTileCache != nil {
+            drawTileCacheFrame(into: ctx)
+        } else {
+            // Pre-navigation / no cache — vector-only on the style's background.
+            drawVectorOnlyFrame(into: ctx)
+        }
+
+        // Weather alert pill — bottom-right, transform-independent (drawn in
+        // the flat outer ctx so it sits in a fixed screen spot regardless of
+        // map rotation/zoom). Placed AFTER the map branch so it overlays the
+        // tiles; a label too wide to fit beside the heading puck switches to
+        // its short hazard name.
+        // No-op when `weatherAlert == nil` (clear weather).
+        drawWeatherAlert(into: ctx)
+
+        // Speed-limit sign — bottom-right corner, transform-independent
+        // like the weather pill. Drawn AFTER the weather pill so the sign
+        // owns the corner; when both are active the weather pill has
+        // already been lifted above the sign (see `drawWeatherAlert`).
+        // No-op unless a limit is map-matched and the display mode allows.
+        drawSpeedLimitSign(into: ctx)
+
+        // Average-speed section panel — same row as the sign, just left of
+        // it. No-op outside a section.
+        drawSpeedSectionPanel(into: ctx)
+
+        // Route progress bar — pinned to the BOTTOM EDGE, full width,
+        // transform-independent (flat outer ctx) like the pills above.
+        // Drawn LAST of the map overlays so it sits on top of the tiles
+        // at the very bottom where nothing else lives. No-op when the nav
+        // pump hasn't pushed a `rideProgress` (feature off / not nav).
+        drawProgressBar(into: ctx)
+
+        // Dash notice ("You've arrived" and friends) — drawn LAST so it sits
+        // above every map overlay, upper middle, transform-independent.
+        // Self-expiring (time-based); no-op when no notice is active.
+        drawNotice(into: ctx)
+
+        // Top-left maneuver overlay — burned into the video so the dash
+        // shows the right arrow regardless of how it interprets the
+        // primary-maneuver TLV (whose enum is largely undocumented).
+        // Nav overlay (maneuver glyph + distance + road name) used to
+        // be baked into the stream here. Removed: turn-by-turn info
+        // now travels to the dash via the K1G "active-nav" bubble
+        // (separate TLV channel), so drawing it on the video would
+        // duplicate the same information on the dash screen. Keep
+        // `drawNavOverlay`/`formatDistance` as dead code
+        // for now in case we want to reintroduce a video-side hint
+        // (e.g. for non-K1G dashes or for the in-app preview).
+        // drawNavOverlay(into: ctx)
+
+        return buffer
+    }
+}
+
+// MARK: - BG render: tile cache composite
+
+extension MapViewSource {
+    /// Draw one BG frame from the pre-rendered tile cache.
+    /// Steps: pick nearest tile → rotate context to heading-up →
+    /// draw cropped tile → polyline → user dot in the center.
+    private func drawTileCacheFrame(into ctx: CGContext) {
+        // If we can't yet composite from baked tiles — no GPS fix, or the
+        // tile layer isn't ready (still baking, or a slow/failed fetch, e.g.
+        // a tester in India on LTE reported "map gone black when starting
+        // the route", 8/2026) — do NOT leave the frame on the bare void
+        // colour (that's the black screen). Fall back to the vector-only
+        // frame so the route line + slate map is always visible.
+        guard lastFix != nil else {
+            drawVectorOnlyFrame(into: ctx)
+            return
+        }
+        // Pick the quality layer for the current effective zoom. Falls
+        // back to base if the preferred sibling layer isn't baked yet.
+        let layerBefore = activeLayer
+        guard let cache = activeTileCache(forEffectiveZoom: effectiveZoom),
+              let fix = lastFix else {
+            drawVectorOnlyFrame(into: ctx)
+            return
+        }
+        // A layer switch invalidates the hint index (it points into the
+        // previous cache's tiles[]). Reset so nearestTile does a fresh
+        // full scan on the new layer rather than trusting a stale hint.
+        if activeLayer != layerBefore { lastTileHintIndex = 0 }
+        var drawCache = cache
+        var picked = cache.nearestTile(to: fix.coordinate, hintIndex: lastTileHintIndex)
+        // Coarse / fine bake no wing rows, so a rider more than one of their
+        // anchor strides off the route misses there — retry base, whose
+        // wings cover off-route. Full scan: the hint indexes the sibling.
+        if picked == nil, let base = routeTileCache, base !== cache {
+            drawCache = base
+            picked = base.nearestTile(to: fix.coordinate, hintIndex: nil)
+        }
+        guard let (refTile, idx) = picked else {
+            // Off the baked route corridor (wrong turn + reroute pending,
+            // or a deliberate detour). Don't drop straight to the bare
+            // vector fallback — try a position-anchored rescue tile first
+            // so the rider keeps real map context under the route line.
+            drawOffCorridorFallbackFrame(into: ctx)
+            return
+        }
+        // A base index is no hint for the active sibling layer.
+        lastTileHintIndex = drawCache === cache ? idx : 0
+
+        // ── HARD INVARIANT: the drawn tile must actually contain the rider ──
+        //
+        // `drawProjectedTile` positions the tile bitmap by the delta between
+        // the tile's own geographic centre and the live GPS fix, so a tile
+        // whose centre is far away doesn't put the puck in the wrong place —
+        // it slides the map out from under the puck, which is what the rider
+        // saw as "my position jumped several km ahead" (field report 8/2026).
+        //
+        // Everything upstream that picks a tile is heuristic: `nearestTile`
+        // takes an argmin with a hint index, and the anchor snapping that
+        // decides which tiles even exist is itself a nearest-match. Both can
+        // be wrong where a route passes near itself. Rather than trust every
+        // one of those heuristics forever, assert the property we actually
+        // care about right where it matters — at draw time, against the raw
+        // GPS fix, which is the one input no heuristic can corrupt.
+        //
+        // On violation: discard the tile and fall through to the
+        // position-anchored rescue path, which bakes a tile centred on the
+        // ACTUAL fix. That is the "hard jump back to the correct position"
+        // behaviour — the map snaps to where the rider really is instead of
+        // continuing to render a plausible-looking but wrong location.
+        let tileDistance = PolylineMath.haversine(fix.coordinate, refTile.center)
+        if tileDistance > RouteTileCache.maxTileCentreDistance {
+            log.error("Tile centre \(Int(tileDistance), privacy: .public) m from fix (limit \(Int(RouteTileCache.maxTileCentreDistance), privacy: .public) m) — rejecting and re-anchoring on the fix")
+            // Stale hint would very likely re-pick the same bad tile next
+            // frame; force a full rescan.
+            lastTileHintIndex = 0
+            drawOffCorridorFallbackFrame(into: ctx)
+            return
+        }
+
+        // NOTE: heading/zoom lerps are advanced once per tick in
+        // `tickOnMain`. Do NOT re-run them here or a rendered frame would
+        // step the animation twice.
+
+        // Each baked tile is already a 5×5 OSM grid stitch — a
+        // 1280×1280 px composite covering ~3.9 km on a side at z=15
+        // (mpp ≈ 3.07 m/px at 50°N × 1280 ≈ 3930 m). That single bitmap
+        // is wider than the dash frame at every zoom level we use, AND
+        // gridSide is odd so the painted area is symmetric about the
+        // centre — so drawing the centre tile alone fully covers the
+        // visible area with no black wedge at the frame edge.
+        //
+        // The old "draw nearest ±2" was inherited from the
+        // MKMapSnapshotter era where each tile was a small clamp
+        // and the renderer had to mosaic neighbours. With OSM stitches
+        // those neighbours OVERLAP each other (anchor stride = 700 m,
+        // tile span = ~3.9 km → ~82 % overlap) and stack on top with
+        // slightly different lat-dependent pxPerDeg → visible seams
+        // and a smeared composite. Single-tile draw is correct here.
+        guard let cg = drawCache.image(for: refTile, atIndex: idx)?.cgImage else {
+            // Decode failed — better a vector frame than a blank one.
+            drawVectorOnlyFrame(into: ctx)
+            return
+        }
+        drawProjectedTile(refTile, image: cg, riderCoord: fix.coordinate, into: ctx)
+    }
+
+    /// Off-corridor rescue frame. Reached when the rider has left the
+    /// baked route corridor (`nearestTile` missed) — after a wrong turn
+    /// while a reroute is still computing (or failed), or on a deliberate
+    /// detour. Instead of dropping straight to the bare vector fallback,
+    /// draw a real OSM map baked around the rider's raw GPS position, so
+    /// they keep genuine map context under the route line.
+    ///
+    /// Degradation ladder: this sits BETWEEN the corridor tile and the
+    /// vector-only frame —
+    ///   1. corridor tile   (drawTileCacheFrame → nearestTile hit)
+    ///   2. position tile    (THIS — off-corridor, map still available)
+    ///   3. vector-only      (drawVectorOnlyFrame — no covering tile yet
+    ///                        or fully offline)
+    ///
+    /// The bake is fire-and-forget: if no covering position tile exists
+    /// yet we kick one off and draw vector-only THIS frame; the tile
+    /// appears on a later frame once it's baked. No blank wait, no
+    /// blocking the render loop. On-route this whole path is dormant, so
+    /// it costs zero extra OSM fetches during normal navigation.
+    private func drawOffCorridorFallbackFrame(into ctx: CGContext) {
+        guard let cache = routeTileCache, let fix = lastFix else {
+            drawVectorOnlyFrame(into: ctx)
+            return
+        }
+        // Kick a bake if we have no covering tile yet (throttled +
+        // coalesced inside the cache; no-op when already covered).
+        ensurePositionFallbackTile(near: fix.coordinate)
+
+        // Draw the covering position tile if we have one, else vector.
+        guard let tile = cache.coveringPositionFallbackTile(for: fix.coordinate),
+              let cg = cache.positionFallbackDecodedImage()?.cgImage else {
+            drawVectorOnlyFrame(into: ctx)
+            return
+        }
+        drawProjectedTile(tile, image: cg, riderCoord: fix.coordinate, into: ctx)
+    }
+
+    /// Shared projection + composite for a SINGLE stitched tile centred
+    /// near the rider. Used by BOTH the on-corridor path
+    /// (`drawTileCacheFrame`) and the off-corridor rescue path
+    /// (`drawOffCorridorFallbackFrame`) so the heading-up rotation, route
+    /// polyline, speed cameras and puck are drawn identically in either
+    /// case — only the source tile differs.
+    ///
+    /// `riderCoord` is the projection origin (the rider sits at the puck);
+    /// `tile.center` is where the bitmap's midpoint lands geographically.
+    private func drawProjectedTile(
+        _ tile: RouteTile,
+        image cg: CGImage,
+        riderCoord: CLLocationCoordinate2D,
+        into ctx: CGContext
+    ) {
+        // Pixels-per-degree — analytic Web Mercator values baked into the
+        // tile (no probe/measure since the OSM migration). Ground truth
+        // for how many ctx-pixels span 1 degree on this bitmap.
+        let pxPerDegLon = tile.pxPerDegLon
+        let pxPerDegLat = tile.pxPerDegLat
+
+        // Anchor coordinate space on the user — they sit at the origin
+        // after rotation; the tile draws offset from that.
+        let centerLon = riderCoord.longitude
+        let centerLat = riderCoord.latitude
+
+        // ─────────────────────────────────────────────────────────────
+        // COORDINATE SYSTEM (Y-DOWN, UIKit convention):
+        //   (0,0) = top-left   (W,0) = top-right
+        //   (0,H) = bottom-left  y increases DOWNWARD
+        //
+        // Outer ctx was Y-flipped in renderMapViewToPixelBuffer to give
+        // us this top-left origin (matches UIKit drawing). We DO NOT
+        // flip again here. The whole drawing path is Y-DOWN.
+        //
+        // Math conventions in this Y-DOWN frame:
+        //   dy = -(lat - centerLat) * pxPerDegLat   (north = -y)
+        //   biasPx is ADDED to anchor y                (down = +y)
+        //   rotation by -heading puts heading at top   (CW rotation)
+        //   ctx.draw(image, in:) renders images upside-down in Y-DOWN;
+        //   we use `drawImageUIKit` helper to flip per-call.
+        // ─────────────────────────────────────────────────────────────
+
+        ctx.saveGState()
+        // Forward bias: anchor the user puck below the geometric centre
+        // so more of the road ahead is visible. In Y-DOWN, "lower on
+        // screen" = larger y, so ADD biasPx.
+        let biasPx = frameSize.height * forwardBiasFraction
+        ctx.translateBy(x: frameSize.width / 2, y: frameSize.height / 2 + biasPx)
+        // Heading-up rotation. In Y-DOWN ctx, CGContext.rotate(by:)
+        // rotates clockwise for positive angles (the Y-flip inverts the
+        // usual math CCW-positive convention). To bring the heading
+        // direction to the TOP of the frame we rotate the map CCW by
+        // `heading` degrees → pass -heading.
+        ctx.rotate(by: -lastHeading * .pi / 180)
+        // Speed-adaptive zoom (slow lerp; see targetZoom/updateZoom).
+        // Applied AFTER rotation so the origin sits at the puck.
+        //
+        // Layer compensation: `currentZoom` is calibrated for the BASE
+        // OSM level (z=15). A coarse (z=13) or fine (z=16) tile has a
+        // different pixel-per-metre density, so drawing it at the raw
+        // `currentZoom` would render it too small (coarse) or too large
+        // (fine). Multiply by 2^(baseZoom - tileZoom) so the on-screen
+        // ground scale is identical whichever layer supplied the tile.
+        let layerScale = pow(2.0, CGFloat(MapViewSource.baseLayerZoom - tile.osmZoom))
+        let drawZoom = currentZoom * layerScale
+        ctx.scaleBy(x: drawZoom, y: drawZoom)
+
+        // Draw the tile shifted by the delta from its own centre to the
+        // user's position. Use `tile.center` (the requested centre — and
+        // the geographic centre of the rendered image).
+        let dx =  (tile.center.longitude - centerLon) * pxPerDegLon
+        let dy = -(tile.center.latitude  - centerLat) * pxPerDegLat   // Y-DOWN: north = -y
+        let tw = tile.pixelSize.width
+        let th = tile.pixelSize.height
+        // For OSM stitches `centerPixel` is the exact bitmap midpoint, so
+        // mpX/mpY are 0; kept general for backward-compat with any tile
+        // whose centre isn't pixel-aligned.
+        let mpX = tw / 2 - tile.centerPixel.x
+        let mpY = th / 2 - tile.centerPixel.y
+        let rect = CGRect(x: CGFloat(dx) - tw / 2 + mpX,
+                          y: CGFloat(dy) - th / 2 + mpY,
+                          width: tw, height: th)
+        drawImageUIKit(cg, in: rect, ctx: ctx)
+
+        // Alternative routes (thin grey), drawn BEFORE the active blue
+        // line so the active route always sits on top. Same Y-DOWN
+        // projection as the active line below. The ETA bubbles are drawn
+        // separately, upright, after restoreGState (see below).
+        if !alternativeRoutes.isEmpty {
+            let projAlt: (CLLocationCoordinate2D) -> CGPoint = { c in
+                let px =  (c.longitude - centerLon) * pxPerDegLon
+                let py = -(c.latitude  - centerLat) * pxPerDegLat   // Y-DOWN
+                return CGPoint(x: CGFloat(px), y: CGFloat(py))
+            }
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            ctx.setStrokeColor(currentStyle.alternativeLineColor)
+            // Slightly thinner than the active route so it reads secondary.
+            // Divide by drawZoom (= currentZoom × layerScale) — the stroke
+            // is inside the layer-compensated scale, so using currentZoom
+            // alone would make the line layerScale× too thick on the coarse
+            // layer (an 8× blue blob) and too thin on fine.
+            ctx.setLineWidth((routeLineScreenPx - 1.5) / drawZoom)
+            for alt in alternativeRoutes {
+                guard alt.coords.count > 1 else { continue }
+                let ap = CGMutablePath()
+                var firstA = true
+                for c in alt.coords {
+                    let pt = projAlt(c)
+                    if firstA { ap.move(to: pt); firstA = false }
+                    else { ap.addLine(to: pt) }
+                }
+                ctx.addPath(ap)
+                ctx.strokePath()
+            }
+        }
+
+        // Draw the route polyline in the same Y-DOWN coordinate space.
+        // Off-corridor this still draws the (now-distant) route line so
+        // the rider can see which way to get back to it. Uses the FULL
+        // trip geometry when available (setFullRoute) so the line spans
+        // the whole route, not just the leg up to the next waypoint.
+        let drawCoords = routeDrawCoords
+        if !drawCoords.isEmpty {
+            // Project a coord into this frame's Y-DOWN pixel space.
+            let project: (CLLocationCoordinate2D) -> CGPoint = { c in
+                let px =  (c.longitude - centerLon) * pxPerDegLon
+                let py = -(c.latitude  - centerLat) * pxPerDegLat   // Y-DOWN
+                return CGPoint(x: CGFloat(px), y: CGFloat(py))
+            }
+            // Build the path once, reuse for casing + fill.
+            let path = CGMutablePath()
+            var first = true
+            for c in drawCoords {
+                let pt = project(c)
+                if first { path.move(to: pt); first = false }
+                else { path.addLine(to: pt) }
+            }
+            ctx.setLineCap(.round)
+            ctx.setLineJoin(.round)
+            // The line is stroked INSIDE the drawZoom scale (currentZoom ×
+            // layerScale), so the width must divide by drawZoom, not just
+            // currentZoom — otherwise on the coarse layer (layerScale 8) the
+            // route rendered as a giant blue blob covering the map, and on
+            // fine it vanished. Divide by drawZoom for a constant on-screen
+            // width regardless of zoom AND which quality layer is active.
+            let lineW = routeLineScreenPx / drawZoom
+            // 1. Casing UNDER the line — dark on Light, white on Dark —
+            //    so the blue route pops against busy map content (rider
+            //    feedback 2026-08). ~4 px wider on screen than the fill.
+            ctx.addPath(path)
+            ctx.setStrokeColor(currentStyle.routeCasingColor)
+            ctx.setLineWidth(lineW + routeCasingScreenPx / drawZoom)
+            ctx.strokePath()
+            // 3. Blue route fill on top.
+            ctx.addPath(path)
+            ctx.setStrokeColor(currentStyle.routeLineColor)
+            ctx.setLineWidth(lineW)
+            ctx.strokePath()
+
+            // 4. Travelled breadcrumb (grey "already ridden") OVER the blue —
+            //    progress-bar look: the covered stretch reads "done" in grey,
+            //    the road ahead stays blue. Blue route-ahead is repainted on
+            //    top next (step 5) so an out-and-back's upcoming retrace wins
+            //    back the blue. Same Y-DOWN projection + width as the fill.
+            if traveledCoords.count > 1 {
+                let tp = CGMutablePath()
+                var firstT = true
+                for c in traveledCoords {
+                    let pt = project(c)
+                    if firstT { tp.move(to: pt); firstT = false }
+                    else { tp.addLine(to: pt) }
+                }
+                ctx.addPath(tp)
+                ctx.setStrokeColor(currentStyle.traveledLineColor)
+                ctx.setLineWidth(lineW)
+                ctx.strokePath()
+            }
+
+            // 5. Route AHEAD in blue, OVER the grey travelled line. On an
+            //    out-and-back the road ahead retraces an already-ridden (now
+            //    grey) segment; repainting the still-to-ride slice blue keeps
+            //    it reading as "upcoming", not "done". No-op off an out-and-back
+            //    (ahead doesn't overlap travelled).
+            if routeAheadCoords.count > 1 {
+                let ap = CGMutablePath()
+                var firstA = true
+                for c in routeAheadCoords {
+                    let pt = project(c)
+                    if firstA { ap.move(to: pt); firstA = false }
+                    else { ap.addLine(to: pt) }
+                }
+                ctx.addPath(ap)
+                ctx.setStrokeColor(currentStyle.routeLineColor)
+                ctx.setLineWidth(lineW)
+                ctx.strokePath()
+            }
+            // Via-stop pins are NOT drawn here — they must be upright +
+            // constant-size, so they're rendered geo-anchored in the outer
+            // (un-rotated) ctx below, same as the speed cameras.
+        }
+
+        ctx.restoreGState()
+
+        // Speed-camera POI markers — geo-anchored (they move/rotate WITH
+        // the map as the rider travels) but drawn upright + constant-size
+        // in the outer ctx so the camera glyph is always readable. Drawn
+        // after the map/route restoreGState, before the puck so the user's
+        // position stays on top. Projection params captured from this
+        // tile-cache frame above.
+        drawSpeedCameras(into: ctx,
+                         centerLat: centerLat, centerLon: centerLon,
+                         pxPerDegLon: pxPerDegLon, pxPerDegLat: pxPerDegLat,
+                         zoom: drawZoom)
+
+        // Via-stop waypoint pins — geo-anchored like the cameras but drawn
+        // upright + constant-size in the outer ctx so the pin glyph always
+        // stands vertical regardless of map rotation/zoom.
+        drawWaypointPins(into: ctx,
+                         centerLat: centerLat, centerLon: centerLon,
+                         pxPerDegLon: pxPerDegLon, pxPerDegLat: pxPerDegLat,
+                         zoom: drawZoom)
+
+        // ETA-delta bubbles for the alternative routes — geo-anchored to
+        // each alt's `bubbleAnchor` but drawn upright + constant size in
+        // the flat outer ctx (same projection trick as the cameras).
+        drawAlternativeBubbles(into: ctx,
+                               centerLat: centerLat, centerLon: centerLon,
+                               pxPerDegLon: pxPerDegLon, pxPerDegLat: pxPerDegLat,
+                               zoom: drawZoom)
+
+        // Draw user direction arrow in the center. The map is rotated
+        // heading-up, so the arrow always points toward the top of the
+        // frame (= direction of travel). Drawn AFTER restoreGState so
+        // it's not affected by tile rotation; uses a local Y-flip so
+        // "tip up" matches screen-up regardless of the outer ctx's
+        // bottom-left vs top-left origin (CVPixelBuffer rows go top→
+        // bottom, so we flip locally to draw in intuitive "tip = +y").
+        drawHeadingArrow(into: ctx)
+        drawZoomOsd(into: ctx)
+    }
+
+    /// Bounding box of the heading puck (outer white ring, radius
+    /// 14 × `puckScale`, at the forward-bias anchor), in the outer Y-DOWN
+    /// ctx. Fixed overlays keep `overlayClearance` off it.
+    private var puckRect: CGRect {
+        let r = 14 * puckScale
+        let cx = frameSize.width / 2
+        let cy = frameSize.height / 2 + frameSize.height * forwardBiasFraction
+        return CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r)
+    }
+
+    /// Apple Maps navigation-mode user puck: blue circle with a white
+    /// chevron arrow inside. The map is rotated heading-up, so the
+    /// chevron always points toward the top of the frame
+    /// (= direction of travel).
+    private func drawHeadingArrow(into ctx: CGContext) {
+        let cx = frameSize.width / 2
+        // Match the forward-bias anchor used in drawTileCacheFrame /
+        // drawVectorOnlyFrame so the puck stays put when we fall back
+        // to vector-only. Coord system here is Y-DOWN (outer ctx); ADD
+        // biasPx to push the puck visually down.
+        let biasPx = frameSize.height * forwardBiasFraction
+        let cy = frameSize.height / 2 + biasPx
+
+        ctx.saveGState()
+        ctx.translateBy(x: cx, y: cy)
+        // Local Y-flip so the chevron coords below read naturally
+        // (tip at +y = pointing UP on screen). Keeps the original
+        // geometry numbers intact even though the outer ctx is Y-DOWN.
+        ctx.scaleBy(x: 1, y: -1)
+        // Uniform puck enlargement — scales the ring, disc and chevron
+        // together so proportions stay identical, just bigger.
+        ctx.scaleBy(x: puckScale, y: puckScale)
+
+        // ── White outer ring (acts as a 2 px border around the puck) ──
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fillEllipse(in: CGRect(x: -14, y: -14, width: 28, height: 28))
+
+        // ── Blue circle ──
+        ctx.setFillColor(CGColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1))
+        ctx.fillEllipse(in: CGRect(x: -12, y: -12, width: 24, height: 24))
+
+        // ── White chevron inside the blue circle (Apple Maps nav style) ──
+        // Tip at top, base near bottom of the circle. Sized to sit cleanly
+        // inside the 24 px disc with ~2 px padding.
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.beginPath()
+        ctx.move(to: CGPoint(x:  0,   y:  8))    // tip
+        ctx.addLine(to: CGPoint(x:  7,   y: -7))    // right base
+        ctx.addLine(to: CGPoint(x:  0,   y: -3))    // back notch
+        ctx.addLine(to: CGPoint(x: -7,   y: -7))    // left base
+        ctx.closePath()
+        ctx.fillPath()
+
+        ctx.restoreGState()
+    }
+
+    /// Transient zoom feedback badge: a small dark disc with a white "+"
+    /// (zoom in) or "−" (zoom out) bar glyph, flashed bottom-left for a
+    /// moment after a manual LEFT/RIGHT nudge so the rider sees the press
+    /// registered. Drawn in the outer Y-DOWN ctx, un-rotated, constant
+    /// size. No-op once the flash window has elapsed.
+    ///
+    /// Glyph is drawn from filled rects (not SF Symbol / text) so it's
+    /// deterministic across iOS versions — same discipline as the other
+    /// CGContext overlays in this file.
+    private func drawZoomOsd(into ctx: CGContext) {
+        guard let osd = zoomOsd else { return }
+        guard Date() < osd.until else {
+            zoomOsd = nil
+            return
+        }
+        let isPlus = osd.symbol == "＋"
+        let atLimit = osd.atLimit
+        let r: CGFloat = 15
+        let ringHalf: CGFloat = 1.3   // half the 2.6-px at-limit ring
+        // Bottom-left, tucked against the dash's own turn card (bottom-right
+        // of it) and just above the progress bar, with the usual clearance.
+        // Same spot in free ride, so it doesn't jump between modes.
+        let cy = frameSize.height - Self.progressBarZoneHeight - Self.overlayClearance - r - ringHalf
+        let reach = Self.navCardRadius + Self.overlayClearance + r + ringHalf
+        let dy = cy - Self.navCardCenter.y
+        let cx = Self.navCardCenter.x + (reach * reach - dy * dy).squareRoot()
+
+        // Dark translucent disc, same on both states so the badge keeps its
+        // place and palette. The white ring + white glyph match the normal
+        // +/− feedback (rider asked to keep the current colours).
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.55))
+        ctx.fillEllipse(in: CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r))
+        let white = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+
+        if atLimit {
+            // Zoom pinned at the clamp: draw a "no-parking"-style sign — a
+            // bold white ring with a single diagonal white bar across it —
+            // so the rider sees the zoom won't go any further. Same white
+            // palette as the +/− badge, no glyph inside (reads as a traffic
+            // prohibition sign rather than a button press).
+            ctx.setStrokeColor(white)
+            ctx.setLineWidth(2.6)
+            ctx.strokeEllipse(in: CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r))
+            let d = r * 0.66   // diagonal half-length (top-left → bottom-right)
+            ctx.setLineCap(.round)
+            ctx.setLineWidth(3.0)
+            ctx.move(to: CGPoint(x: cx - d, y: cy - d))
+            ctx.addLine(to: CGPoint(x: cx + d, y: cy + d))
+            ctx.strokePath()
+            return
+        }
+
+        // Normal nudge feedback: thin white ring + white +/− glyph.
+        ctx.setStrokeColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.9))
+        ctx.setLineWidth(1.5)
+        ctx.strokeEllipse(in: CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r))
+
+        let barLen: CGFloat = 14
+        let barThick: CGFloat = 2.6
+        ctx.setFillColor(white)
+        // Horizontal bar (present for both + and −).
+        ctx.fill(CGRect(x: cx - barLen / 2, y: cy - barThick / 2,
+                        width: barLen, height: barThick))
+        if isPlus {
+            // Vertical bar completes the "+".
+            ctx.fill(CGRect(x: cx - barThick / 2, y: cy - barLen / 2,
+                            width: barThick, height: barLen))
+        }
+    }
+
+    /// Project each via-stop into the outer (un-rotated) Y-DOWN ctx and
+    /// draw an upright, constant-size map pin. Same geo→screen math as
+    /// `drawSpeedCameras` so the pin tip sits exactly on the route line.
+    /// No-op when there are no via-stops (single-destination trips).
+    private func drawWaypointPins(into ctx: CGContext,
+                                  centerLat: Double, centerLon: Double,
+                                  pxPerDegLon: Double, pxPerDegLat: Double,
+                                  zoom: CGFloat) {
+        guard !waypointDots.isEmpty else { return }
+        let theta = -lastHeading * .pi / 180.0
+        let cosT = cos(theta), sinT = sin(theta)
+        let biasPx = Double(frameSize.height) * Double(forwardBiasFraction)
+        let anchorX = Double(frameSize.width) / 2
+        let anchorY = Double(frameSize.height) / 2 + biasPx
+        let z = Double(zoom)
+        let w = Double(frameSize.width), h = Double(frameSize.height)
+        for wp in waypointDots {
+            let dx = (wp.longitude - centerLon) * pxPerDegLon
+            let dy = -(wp.latitude - centerLat) * pxPerDegLat  // Y-DOWN
+            let zx = dx * z, zy = dy * z
+            let rx = zx * cosT - zy * sinT
+            let ry = zx * sinT + zy * cosT
+            let px = anchorX + rx
+            let py = anchorY + ry
+            // Cull off-frame pins (margin clears the pin body + tip).
+            guard px > -28, px < w + 28, py > -48, py < h + 16 else { continue }
+            drawWaypointPin(into: ctx, at: CGPoint(x: px, y: py))
+        }
+    }
+
+    /// One upright map-pin marker whose TIP sits at `p` (Y-DOWN outer ctx):
+    /// a round head above the anchor with a spike down to the tip whose
+    /// sides are TANGENT to the head, so it reads as a clean teardrop
+    /// (rider reference 2026-08). Route-blue with a white outline and a
+    /// white centre hole. Constant on-screen size. Built from a filled
+    /// circle + a filled tangent triangle (both always closed/filled) —
+    /// the earlier hand-rolled arc path rendered as a broken "V".
+    private func drawWaypointPin(into ctx: CGContext, at p: CGPoint) {
+        let fill = currentStyle.waypointDotColor
+        let white = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+
+        // Geometry (Y-DOWN: tip at p, head bulges UP = smaller y).
+        let headR: CGFloat = 10      // head radius (enlarged per feedback)
+        let tipDrop: CGFloat = 27    // tip is this far below the head centre
+        let cx = p.x
+        let cy = p.y - tipDrop       // head centre, above the tip
+
+        // Build the pin shape for a given head radius `r` (the tip stays at
+        // `p`). The spike is the triangle from the tip to the two points
+        // where lines from the tip are TANGENT to the head circle — this is
+        // what makes the spike flow smoothly into the head instead of
+        // cutting a flat chord. Tangent contact angle from the tip→centre
+        // (straight-up) direction is acos(r/d).
+        func pinPath(_ r: CGFloat) -> CGPath {
+            let d = tipDrop                         // tip→centre distance
+            let path = CGMutablePath()
+            // Head circle.
+            path.addEllipse(in: CGRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
+            // Tangent spike (skip if geometry degenerates, r >= d).
+            if d > r {
+                let a = acos(r / d)                 // angle at centre to each contact pt
+                let sinA = sin(a), cosA = cos(a)
+                // Contact points on the LOWER arc (cos positive = below centre).
+                let lx = cx - r * sinA, rx = cx + r * sinA
+                let cyC = cy + r * cosA
+                path.move(to: CGPoint(x: p.x, y: p.y))   // tip
+                path.addLine(to: CGPoint(x: lx, y: cyC)) // left tangent contact
+                path.addLine(to: CGPoint(x: rx, y: cyC)) // right tangent contact
+                path.closeSubpath()
+            }
+            return path
+        }
+
+        ctx.saveGState()
+        // 1. White outline: the same shape, 2 px larger head, drawn behind.
+        ctx.setFillColor(white)
+        ctx.addPath(pinPath(headR + 2))
+        ctx.fillPath()
+        // 2. Blue fill.
+        ctx.setFillColor(fill)
+        ctx.addPath(pinPath(headR))
+        ctx.fillPath()
+        // 3. White centre hole in the head.
+        ctx.setFillColor(white)
+        let holeR: CGFloat = 4.0
+        ctx.fillEllipse(in: CGRect(x: cx - holeR, y: cy - holeR,
+                                   width: holeR * 2, height: holeR * 2))
+        ctx.restoreGState()
+    }
+
+    /// Speed → zoom mapping. Linear ramp from "close" at standstill to
+    /// "wide" at highway speeds, so the rider sees more road ahead the
+    /// faster they go.
+    ///   0 km/h → 2.0×   (city — tight, street-level detail)
+    ///  60 km/h → 1.4×   (rural / regional)
+    /// 130+ km/h → 0.8×  (highway, wide field of view)
+    /// Returned value is clamped to [0.8, 2.0]; if speed is invalid
+    /// (CoreLocation reports < 0 when unknown) we keep the current zoom.
+    ///
+    /// Tuned up from the original 0.6–1.5 range on rider feedback
+    /// (2026-06: "city map is too zoomed out, hard to see where to go").
+    private func targetZoom(forSpeedMPS speed: Double) -> CGFloat {
+        guard speed >= 0 else { return currentZoom }
+        let kmh = speed * 3.6
+        // slope: (0.8 - 2.0) / 130 = -0.00923 per km/h
+        let raw = 2.0 - CGFloat(kmh) * 0.00923
+        let speedZoom = min(max(raw, 0.8), 2.0)
+        return speedZoom * maneuverZoomBoost() * userZoomBias
+    }
+
+    /// Extra zoom-in as a maneuver approaches, so the rider can see
+    /// exactly which way the turn goes. Ramps from 1.0× (no boost) at
+    /// `boostStartMeters` out, up to `maxManeuverBoost` right at the turn.
+    /// Returns 1.0 when not navigating or the next step is far away.
+    private func maneuverZoomBoost() -> CGFloat {
+        guard let nav = activeNavigator, nav.isNavigating else { return 1.0 }
+        let d = nav.distanceToNextStep
+        guard d > 0 else { return 1.0 }
+        let boostStartMeters: CGFloat = 200
+        let boostFullMeters: CGFloat = 40     // fully boosted by 40 m out
+        let maxManeuverBoost: CGFloat = 1.45
+        if d >= boostStartMeters { return 1.0 }
+        if d <= boostFullMeters { return maxManeuverBoost }
+        // Linear interp: 1.0 at boostStart → maxBoost at boostFull.
+        let t = (boostStartMeters - CGFloat(d)) / (boostStartMeters - boostFullMeters)
+        return 1.0 + (maxManeuverBoost - 1.0) * t
+    }
+
+    /// Lerp `currentZoom` toward the target by 7.5%/frame. At 4 fps this
+    /// gives roughly 10 seconds for a full city→highway transition
+    /// (95% completion in ~38 frames). Slow enough that the rider
+    /// doesn't see the map "breathing" on small speed wobbles.
+    ///
+    /// Exception: the maneuver-approach boost needs to land BEFORE the
+    /// turn, not 10 s later, so when we're zooming IN (target > current)
+    /// we lerp ~3× faster (22%/frame). Zooming back out after the turn
+    /// stays slow so the map doesn't lurch.
+    ///
+    /// The factors are per frame, so they were rescaled when the stream
+    /// went from 6 to 4 fps (0.05 → 0.075, 0.15 → 0.22) to keep the same
+    /// per-second feel.
+    private func updateZoom() {
+        decayZoomBias()
+        let target = targetZoom(forSpeedMPS: lastFix?.speed ?? -1)
+        let zoomingIn = target > currentZoom
+        let factor: CGFloat = zoomingIn ? 0.22 : 0.075
+        currentZoom += (target - currentZoom) * factor
+    }
+
+    /// Lerp `lastHeading` toward `targetHeading` by 22%/frame, taking
+    /// the short way around the compass circle (handles the 359°→1°
+    /// wrap without the map spinning the long way).
+    ///
+    /// At 4 fps, 22%/frame ≈ 95% completion in ~3 s — fast enough
+    /// that the rider feels the map track the turn, slow enough that
+    /// a single noisy fix doesn't yank the view. (Was 15%/frame at
+    /// 6 fps — same per-second rate.)
+    private func updateHeading() {
+        let factor: Double = 0.22
+        var delta = targetHeading - lastHeading
+        // Wrap delta into [-180, +180] so we turn the short way.
+        while delta > 180 { delta -= 360 }
+        while delta < -180 { delta += 360 }
+        var next = lastHeading + delta * factor
+        // Normalise the result into [0, 360).
+        while next < 0 { next += 360 }
+        while next >= 360 { next -= 360 }
+        lastHeading = next
+    }
+
+    /// Vector-only fallback: style background + polyline + puck.
+    /// Used when the tile cache is unavailable or the user has gone
+    /// off the cached corridor.
+    private func drawVectorOnlyFrame(into ctx: CGContext) {
+        // NOTE: heading/zoom lerps are advanced once per tick in
+        // `tickOnMain`, never here — this path is also reached as the
+        // off-route fallback from drawTileCacheFrame, so stepping the
+        // lerps here would double-advance them on a rendered frame.
+        // Style-aware background (light stone for Light, dark slate for
+        // Dark) so the pre-nav / off-corridor fallback matches the map
+        // palette instead of always being dark.
+        ctx.setFillColor(currentStyle.vectorBackground)
+        ctx.fill(CGRect(x: 0, y: 0, width: frameSize.width, height: frameSize.height))
+
+        guard let fix = lastFix, !routeDrawCoords.isEmpty else {
+            // Nothing useful to draw.
+            return
+        }
+
+        // Same ground scale as the base tile layer (z=15 m/px at this
+        // latitude; `currentZoom` is applied on top below, as in the tile
+        // path), so dropping to this fallback doesn't jump the zoom.
+        let centerLat = fix.coordinate.latitude
+        let metersPerPx = WebMercator.metersPerPixel(latitude: centerLat,
+                                                     zoom: MapViewSource.baseLayerZoom)
+        let centerLon = fix.coordinate.longitude
+        let mPerDegLat = 111_320.0
+        let mPerDegLon = 111_320.0 * cos(centerLat * .pi / 180)
+
+        ctx.saveGState()
+        // Y-DOWN convention throughout — same coord system as
+        // drawProjectedTile (see big comment block there).
+        let biasPx = frameSize.height * forwardBiasFraction
+        ctx.translateBy(x: frameSize.width / 2, y: frameSize.height / 2 + biasPx)
+        ctx.rotate(by: -lastHeading * .pi / 180)
+        ctx.scaleBy(x: currentZoom, y: currentZoom)
+
+        // Project a coord into this frame's Y-DOWN pixel space (meters/px).
+        let project: (CLLocationCoordinate2D) -> CGPoint = { c in
+            let dxM =  (c.longitude - centerLon) * mPerDegLon
+            let dyM = -(c.latitude  - centerLat) * mPerDegLat   // Y-DOWN
+            return CGPoint(x: CGFloat(dxM / metersPerPx), y: CGFloat(dyM / metersPerPx))
+        }
+        // Build the full route path once, reuse for casing + fill.
+        let path = CGMutablePath()
+        var first = true
+        for c in routeDrawCoords {
+            let pt = project(c)
+            if first { path.move(to: pt); first = false }
+            else { path.addLine(to: pt) }
+        }
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        // Constant on-screen thickness regardless of zoom (see the tile
+        // path's note). Divide by currentZoom since we stroke inside the
+        // zoom scale. Casing under the blue line + via-stop dots, matching
+        // the tile-cache path.
+        let lineW = routeLineScreenPx / currentZoom
+        ctx.addPath(path)
+        ctx.setStrokeColor(currentStyle.routeCasingColor)
+        ctx.setLineWidth(lineW + routeCasingScreenPx / currentZoom)
+        ctx.strokePath()
+        ctx.addPath(path)
+        ctx.setStrokeColor(currentStyle.routeLineColor)
+        ctx.setLineWidth(lineW)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // Via-stop pins upright + constant-size in the OUTER ctx (after the
+        // rotated CTM is popped), same as the tile-cache path. Reproduce
+        // the rotate·scale·translate the CTM applied so the pin lands where
+        // the in-CTM line does, but draws vertical.
+        if !waypointDots.isEmpty {
+            let theta = -Double(lastHeading) * .pi / 180.0
+            let cosT = cos(theta), sinT = sin(theta)
+            let z = Double(currentZoom)
+            let anchorX = Double(frameSize.width) / 2
+            let anchorY = Double(frameSize.height) / 2 + Double(biasPx)
+            for wp in waypointDots {
+                let dxM =  (wp.longitude - centerLon) * mPerDegLon
+                let dyM = -(wp.latitude  - centerLat) * mPerDegLat  // Y-DOWN
+                let px = dxM / metersPerPx, py = dyM / metersPerPx
+                let zx = px * z, zy = py * z
+                let rx = zx * cosT - zy * sinT
+                let ry = zx * sinT + zy * cosT
+                drawWaypointPin(into: ctx, at: CGPoint(x: anchorX + rx, y: anchorY + ry))
+            }
+        }
+
+        // User direction arrow in the centre (same chevron as the
+        // tile-cache path; map is heading-up so arrow always points up).
+        drawHeadingArrow(into: ctx)
+        drawZoomOsd(into: ctx)
+    }
+
+    private func preparePool() {
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: Int(frameSize.width),
+            kCVPixelBufferHeightKey as String: Int(frameSize.height),
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        ]
+        var pool: CVPixelBufferPool?
+        CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool)
+        pixelBufferPool = pool
+    }
+
+    /// Draw a CGImage right-side-up in a Y-DOWN context.
+    ///
+    /// `ctx.draw(image, in: rect)` is documented to render images
+    /// upside-down when the CTM has a Y-flip (Apple's CGContext.draw
+    /// reference, "Discussion" section). Our render pipeline is Y-DOWN
+    /// throughout — outer flip in `renderMapViewToPixelBuffer` aligns
+    /// CVPixelBuffer row 0 with visual top for VideoToolbox — so every
+    /// raw bitmap blit hits this case.
+    ///
+    /// This helper wraps the draw in a local saveGState + per-call
+    /// Y-flip so the image renders right-side-up without contaminating
+    /// the outer CTM (which still drives vector math in Y-DOWN). The
+    /// flip is anchored on `rect.midY` so adjacent rects stay
+    /// pixel-aligned (no seams between adjacent tiles).
+    fileprivate func drawImageUIKit(_ image: CGImage, in rect: CGRect, ctx: CGContext) {
+        ctx.saveGState()
+        ctx.translateBy(x: 0, y: rect.midY)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.translateBy(x: 0, y: -rect.midY)
+        ctx.draw(image, in: rect)
+        ctx.restoreGState()
+    }
+}
+
+// MARK: - Route rendering
+
+extension MapViewSource {
+    func setRoutePolyline(_ polyline: MKPolyline?) {
+        if let polyline {
+            // Cache coords for the BG composite path.
+            let n = polyline.pointCount
+            let pts = polyline.points()
+            var coords: [CLLocationCoordinate2D] = []
+            coords.reserveCapacity(n)
+            for i in 0..<n { coords.append(pts[i].coordinate) }
+            routePolylineCoords = coords
+        } else {
+            routePolylineCoords = []
+        }
+    }
+
+    /// Push the ENTIRE trip geometry + the intermediate via-stops so the
+    /// dash shows the whole planned route (not just the leg up to the next
+    /// waypoint) with a blue pin at each via-stop. Pass `full` = the
+    /// concatenated coordinates of every leg's selected option, and
+    /// `waypoints` = the intermediate stops only (exclude origin + final
+    /// destination). Pass empty arrays to clear (single-destination /
+    /// legacy paths fall back to `routePolylineCoords`).
+    func setFullRoute(coords full: [CLLocationCoordinate2D],
+                      waypoints: [CLLocationCoordinate2D]) {
+        fullRouteCoords = full
+        waypointDots = waypoints
+    }
+
+    /// Push the rider's travelled breadcrumb (grey "already ridden" line).
+    /// Pass an empty array to clear (fresh ride / not navigating). Pushed
+    /// each nav tick from `ActiveNavigator.traveledCoordinates`.
+    func setTraveled(_ coords: [CLLocationCoordinate2D]) {
+        traveledCoords = coords
+    }
+
+    /// Push the route still AHEAD of the rider (from `routeAheadCoordinates`,
+    /// already trimmed to the current segment onward). Drawn in blue OVER the
+    /// grey travelled breadcrumb so that on an out-and-back — where the road
+    /// ahead retraces an already-ridden segment — the upcoming stretch reads
+    /// blue again, not "done" grey. Pass empty to clear (not navigating).
+    func setRouteAhead(_ coords: [CLLocationCoordinate2D]) {
+        routeAheadCoords = coords
+    }
+
+    /// The coordinates the route-line draw should stroke: the full trip if
+    /// available, else the active-leg polyline (legacy / single-dest).
+    fileprivate var routeDrawCoords: [CLLocationCoordinate2D] {
+        fullRouteCoords.isEmpty ? routePolylineCoords : fullRouteCoords
+    }
+
+    /// Push the alternative routes for the current leg (thin grey lines +
+    /// ETA-delta bubbles). Pass an empty array to clear (no alternatives,
+    /// or the feature is off). Called from MapPickerView / AppStatus as the
+    /// active leg's alternatives change.
+    func setAlternativeRoutes(_ alts: [AlternativeRouteRender]) {
+        alternativeRoutes = alts
+    }
+}
+
+/// A single alternative route to draw on the dash: its geometry plus a
+/// short ETA-delta label ("+5 min", "−2 min", "similar") and the anchor
+/// coordinate the bubble is pinned to (the fork point where it diverges
+/// from the active route reads best; the midpoint is a safe default).
+struct AlternativeRouteRender: Identifiable {
+    let id: UUID
+    /// Full coordinate list of this alternative.
+    let coords: [CLLocationCoordinate2D]
+    /// ETA delta vs the active route, seconds (positive = slower).
+    let etaDeltaSeconds: TimeInterval
+    /// Coordinate the ETA bubble is anchored to.
+    let bubbleAnchor: CLLocationCoordinate2D
+
+    /// "+5 min" / "−2 min" / "similar" (|delta| < 30 s reads "similar").
+    var etaDeltaLabel: String {
+        let mins = Int((etaDeltaSeconds / 60).rounded())
+        if abs(mins) < 1 { return "similar" }
+        let sign = mins > 0 ? "+" : "−"
+        return "\(sign)\(abs(mins)) min"
+    }
+}
+
+// MARK: - Active-nav overlay (Phase 9e)
+//
+// Top-left maneuver glyph + "distance to next turn" text, burned into
+// the same pixel buffer that gets H.264-encoded. The dash sees these
+// as part of the projected map and can't tell them apart from the
+// underlying tiles.
+//
+// State is pushed in from ActiveNavLoop on every nav tick. We snapshot
+// just the values we need (kind + distance + road name) so we don't
+// have to keep a strong ref to the navigator.
+
+extension MapViewSource {
+    struct NavOverlayState {
+        var kind: ManeuverKind
+        var distanceMeters: Double  // distance to next maneuver
+        var roadName: String?       // current road, optional
+        var unitsImperial: Bool     // for distance string formatting
+    }
+
+    /// Caller (typically ActiveNavLoop) pushes the latest nav state.
+    /// Pass `nil` to clear the overlay (stops drawing).
+    func setNavOverlay(_ state: NavOverlayState?) {
+        self.navOverlayState = state
+    }
+
+    /// Ride-progress state for the bottom-edge progress bar. `fraction`
+    /// is 0…1 (how far along the whole trip). `waypointFractions` are the
+    /// 0…1 positions of intermediate pass-through waypoints (empty for a
+    /// direct route). The bar renders the DONE portion (left) grey and the
+    /// REMAINING portion (right) blue, with a marker at the current
+    /// position and a tick at each waypoint.
+    struct RideProgress {
+        var fraction: Double            // 0…1 completed
+        var waypointFractions: [Double] // 0…1 via-point positions
+        /// 0…1 position of a known weather hazard along the trip (e.g. rain
+        /// we know sits 15 km ahead), or `nil` when there's no located
+        /// hazard. Drawn as a coloured band on the bar so the rider sees
+        /// WHERE on the route the weather hits, not just that it's coming.
+        var hazardFraction: Double? = nil
+        /// 0…1 span of a contiguous hazard stretch (near edge → far edge),
+        /// or `nil` for a point hazard. When present the bar paints the
+        /// whole stretch (`hazardStartFraction`…`hazardEndFraction`)
+        /// instead of a single band at `hazardFraction`.
+        var hazardStartFraction: Double? = nil
+        var hazardEndFraction: Double? = nil
+        /// Whether the hazard is a warning (red) vs a caution (amber). Only
+        /// meaningful when `hazardFraction != nil`.
+        var hazardIsWarning: Bool = false
+    }
+
+    /// Push the latest ride-progress (or `nil` to hide the bar). Mirrors
+    /// `setNavOverlay`'s shape so the nav pump drives both the same way.
+    func setRideProgress(_ progress: RideProgress?) {
+        self.rideProgress = progress
+    }
+
+    fileprivate func drawNavOverlay(into ctx: CGContext) {
+        guard let s = navOverlayState else { return }
+
+        // 1. Glyph in a 70×70 box at top-left, 12 px margin.
+        // Add a soft dark backdrop so the white arrow + text reads
+        // over bright map backgrounds.
+        let pad: CGFloat = 12
+        let backdrop = CGRect(x: pad - 6, y: pad - 6, width: 70 + 12, height: 70 + 12)
+        ctx.saveGState()
+        ctx.setFillColor(red: 0, green: 0, blue: 0, alpha: 0.55)
+        let path = CGPath(
+            roundedRect: backdrop,
+            cornerWidth: 10,
+            cornerHeight: 10,
+            transform: nil
+        )
+        ctx.addPath(path)
+        ctx.fillPath()
+        ctx.restoreGState()
+
+        ctx.saveGState()
+        ctx.translateBy(x: pad, y: pad)
+        ManeuverIcon.draw(s.kind, in: ctx)
+        ctx.restoreGState()
+
+        // 2. Distance label centred under the glyph backdrop.
+        let distText = Self.formatDistance(meters: s.distanceMeters, imperial: s.unitsImperial)
+        Self.drawText(
+            distText,
+            in: ctx,
+            at: CGPoint(x: pad - 6, y: backdrop.maxY + 4),
+            width: backdrop.width,
+            fontSize: 18,
+            bold: true
+        )
+
+        // 3. Road name to the right of the glyph, vertically centred.
+        if let road = s.roadName, !road.isEmpty {
+            let roadOriginX = backdrop.maxX + 10
+            let roadWidth = frameSize.width - roadOriginX - pad
+            Self.drawText(
+                road,
+                in: ctx,
+                at: CGPoint(x: roadOriginX, y: pad + 20),
+                width: roadWidth,
+                fontSize: 22,
+                bold: false
+            )
+        }
+    }
+
+    private static func formatDistance(meters m: Double, imperial: Bool) -> String {
+        if imperial {
+            let mi = m / 1609.344
+            if m < 160 { // < ~0.1 mi → feet
+                let ft = Int((m * 3.280839895).rounded())
+                return "\(ft) ft"
+            } else if mi < 10 {
+                return String(format: "%.1f mi", mi)
+            } else {
+                return String(format: "%.0f mi", mi)
+            }
+        } else {
+            if m < 1000 {
+                return "\(Int(m.rounded())) m"
+            } else if m < 10_000 {
+                return String(format: "%.1f km", m / 1000.0)
+            } else {
+                return String(format: "%.0f km", m / 1000.0)
+            }
+        }
+    }
+
+    /// Compact along-route distance for the weather pill's suffix, e.g.
+    /// "15 km" / "9 mi". Deliberately COARSER than `formatDistance`: a
+    /// weather sample is only accurate to its 1–10 km spacing, so showing
+    /// "14.7 km" would fake precision and cost pill width. Rounds to whole
+    /// km/mi above the sub-unit threshold, and to the nearest 100 m / 500 ft
+    /// only when the hazard is very close (so a hazard 300 m ahead doesn't
+    /// collapse to "0 km"). `nonisolated static` so the unit tests can pin
+    /// the formatting synchronously without hopping onto the main actor
+    /// (the type is `@MainActor`; this pure helper has no reason to be).
+    nonisolated static func formatAheadDistance(meters m: Double, imperial: Bool) -> String {
+        if imperial {
+            let mi = m / 1609.344
+            if mi < 0.5 {
+                // Round to the nearest 500 ft when very close.
+                let ft = Int(((m * 3.280839895) / 500).rounded() * 500)
+                return "\(max(500, ft)) ft"
+            }
+            return "\(Int(mi.rounded())) mi"
+        } else {
+            if m < 1000 {
+                // Round to the nearest 100 m when under a km.
+                let hundreds = Int((m / 100).rounded()) * 100
+                return "\(max(100, hundreds)) m"
+            }
+            return "\(Int((m / 1000).rounded())) km"
+        }
+    }
+
+    /// Weight of the bold overlay text (weather pill, notice card, notice
+    /// glyph letters). Callers that measure text for layout must use this
+    /// same weight, or the pill/card is sized for a narrower font and
+    /// `drawText`'s clip cuts the last glyph.
+    fileprivate static let overlayTextWeight: UIFont.Weight = .bold
+
+    private static func drawText(
+        _ text: String,
+        in ctx: CGContext,
+        at origin: CGPoint,
+        width: CGFloat,
+        fontSize: CGFloat,
+        bold: Bool
+    ) {
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: bold
+                ? UIFont.systemFont(ofSize: fontSize, weight: overlayTextWeight)
+                : UIFont.systemFont(ofSize: fontSize, weight: .regular),
+            .foregroundColor: UIColor.white,
+            .strokeColor: UIColor.black,
+            .strokeWidth: -3.0  // negative = stroke + fill
+        ]
+        // Fold to plain ASCII: the video overlay shares the dash's
+        // ASCII-only constraint, and Core Text would otherwise render
+        // diacritics the dash font can't (Martin, 8/2026). No-op on
+        // strings that are already ASCII (distances, times, "N of M").
+        let attributed = NSAttributedString(string: text.dashSafe, attributes: attrs)
+        let line = CTLineCreateWithAttributedString(attributed)
+
+        // Core Text draws Y-up; our outer ctx is Y-down post-flip.
+        // We flip locally so the text isn't upside-down.
+        ctx.saveGState()
+        // The text matrix is NOT part of the graphics state, and UIKit
+        // string drawing (`NSString.draw` in the speed-limit sign and the
+        // average-speed panel, both drawn earlier in the same frame) leaves
+        // it flipped — which turned everything drawn here afterwards upside
+        // down, e.g. the "You've arrived" notice. Reset it before every draw.
+        ctx.textMatrix = .identity
+        ctx.translateBy(x: origin.x, y: origin.y + fontSize)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.textPosition = .zero
+        // Truncate the width via clip — CT line will draw what fits and
+        // clip the rest. Vertically the clip spans 0.4 em below the baseline
+        // to 1.2 em above it: the old -1…0.6 em band cut the top ~2 px off
+        // capitals, digits and the "i" dot (caps are ~0.7 em tall).
+        ctx.clip(to: CGRect(x: 0, y: -0.4 * fontSize, width: width, height: fontSize * 1.6))
+        CTLineDraw(line, ctx)
+        ctx.restoreGState()
+    }
+}
+
+// MARK: - Ride-alerts overlay (weather pill + speed cameras)
+//
+// Two burned-in overlays the rider asked for (6/2026), grouped here so
+// the map/nav code above stays focused:
+//
+//   • Weather pill — a compact, glanceable badge in the BOTTOM-RIGHT
+//     corner (chosen by the rider: doesn't overlap the route or the
+//     forward-biased puck, and there's free space there). Transform-
+//     independent: drawn in the flat outer Y-DOWN ctx so it stays pinned
+//     to the same screen corner regardless of map rotation/zoom.
+//
+//   • Speed-camera markers — geo-anchored POIs. Their POSITION rides with
+//     the map (we re-apply the exact same scale→rotate→translate CTM the
+//     polyline uses, by hand, so a camera sits precisely on its road), but
+//     the icon itself is drawn UPRIGHT and constant-size like a real map
+//     pin, so it never ends up sideways when the map rotates heading-up.
+//
+// Both are pure CGContext paths (no asset catalog, no SF Symbols),
+// matching the maneuver-glyph philosophy: legible over arbitrary OSM
+// tiles after H.264 chroma subsampling.
+
+extension MapViewSource {
+
+    /// Push the latest weather alert (or `nil` to clear). Mirrors
+    /// `setNavOverlay`'s shape so the nav pump drives both the same way.
+    /// `imperial` sets the distance-suffix units for the pill; it's
+    /// irrelevant on a clear (`nil`) so it defaults to the metric case.
+    func setWeatherAlert(_ alert: WeatherAlert?, imperial: Bool = false) {
+        self.weatherAlert = alert
+        self.weatherImperial = imperial
+    }
+
+    /// Raise a notice on the dash for `notice.duration` seconds. The
+    /// universal "tell the rider something" entry point — any caller (arrival,
+    /// warnings, connection loss, future info) hands in a `DashNotice` and the
+    /// render loop burns it into the video (upper middle), then clears it once
+    /// the duration elapses. Duration is clamped to a sane 1…15 s band.
+    /// Passing `nil` clears any active notice immediately.
+    func showNotice(_ notice: DashNotice?) {
+        guard let notice else {
+            self.activeNotice = nil
+            return
+        }
+        let clamped = max(1, min(15, notice.duration))
+        self.activeNotice = (notice, Date().addingTimeInterval(clamped))
+    }
+
+    /// Show (or with nil, hide) the average-speed section panel.
+    func setSpeedSection(_ reading: SpeedSectionTracker.Reading?) {
+        self.speedSection = reading
+    }
+
+    /// Install the speed cameras to plot (prefetched along the route).
+    /// Pass `[]` to clear.
+    func setSpeedCameras(_ cameras: [SpeedCamera]) {
+        self.speedCameras = cameras
+    }
+
+    // MARK: Speed-limit sign
+
+    /// Install the speed-limit layer to map-match against (prefetched along
+    /// the route): the tagged limit ways AND the bare road geometry for the
+    /// shadow guard. Pass `.empty` to clear (also clears the current sign).
+    func setSpeedLimits(_ data: SpeedLimitData) {
+        speedLimitInstallGeneration &+= 1
+        guard !data.limits.isEmpty else {
+            installSpeedLimits(data, wayGrid: nil, roadGrid: nil)
+            return
+        }
+        // The grids are built off main: 89.5 ms for a ~40 km Prague route
+        // (116k segments) in the first field log, and it grows with the
+        // bbox. Until they land the previous ways + grids stay installed as
+        // a consistent pair; a newer install (or `.empty`) supersedes this.
+        let generation = speedLimitInstallGeneration
+        let wayLines = data.limits.map(\.coords)
+        let roadLines = data.roads.map(\.coords)
+        Task { @MainActor [weak self] in
+            let built = await Self.buildSpeedLimitGrids(ways: wayLines, roads: roadLines)
+            guard let self, generation == self.speedLimitInstallGeneration else { return }
+            self.installSpeedLimits(data, wayGrid: built.ways, roadGrid: built.roads)
+            self.log.info("Speed-limit grid: \(data.limits.count, privacy: .public) ways / \(built.ways.segmentCount, privacy: .public) segs / \(built.ways.cellCount, privacy: .public) cells, \(data.roads.count, privacy: .public) roads / \(built.roads.segmentCount, privacy: .public) segs / \(built.roads.cellCount, privacy: .public) cells, built off main in \(built.ms, format: .fixed(precision: 1), privacy: .public) ms")
+        }
+    }
+
+    @concurrent nonisolated private static func buildSpeedLimitGrids(
+        ways: [[CLLocationCoordinate2D]], roads: [[CLLocationCoordinate2D]]
+    ) async -> (ways: SegmentGrid, roads: SegmentGrid, ms: Double) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let wayGrid = SegmentGrid(lines: ways)
+        let roadGrid = SegmentGrid(lines: roads)
+        return (wayGrid, roadGrid, (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+    }
+
+    private func installSpeedLimits(_ data: SpeedLimitData, wayGrid: SegmentGrid?, roadGrid: SegmentGrid?) {
+        speedLimitWays = data.limits
+        speedLimitRoads = data.roads
+        speedLimitWayGrid = wayGrid
+        speedLimitRoadGrid = roadGrid
+        if data.limits.isEmpty {
+            currentLimitKmh = nil
+            isOverSpeedLimit = false
+        } else if let fix = lastFix {
+            recomputeSpeedLimit(for: fix)
+        }
+    }
+
+    /// Push the display policy from settings. `mode` is the raw
+    /// `SpeedLimitDisplay` value ("off" / "always" / "overOnly"). Cheap —
+    /// called on prefetch and every nav tick so a settings change takes
+    /// effect on the next frame without a re-fetch.
+    func setSpeedLimitConfig(mode: String, toleranceKmh: Double, imperial: Bool) {
+        self.speedLimitMode = mode
+        self.speedLimitToleranceKmh = toleranceKmh
+        self.speedLimitImperial = imperial
+    }
+
+    /// Map-match the current GPS fix to the nearest tagged way and update
+    /// `currentLimitKmh` / `isOverSpeedLimit` with snap + hysteresis. Runs
+    /// at GPS cadence (~1 Hz), not per render frame.
+    private func recomputeSpeedLimit(for fix: Fix) {
+        guard speedLimitMode != "off", !speedLimitWays.isEmpty else {
+            currentLimitKmh = nil
+            isOverSpeedLimit = false
+            return
+        }
+        // Grid query first (exact when it returns a hit — see SegmentGrid);
+        // full scan only when nothing is provably nearest within the 3×3
+        // window, i.e. the rider is ~250 m+ off every loaded road.
+        let match: SpeedLimitMatch
+        if let hit = speedLimitWayGrid?.nearestWithinWindow(to: fix.coordinate) {
+            match = SpeedLimitMatch(kmh: speedLimitWays[hit.line].maxspeedKmh,
+                                    distanceMeters: hit.distanceMeters)
+        } else if let full = SpeedLimitService.nearestLimit(to: fix.coordinate,
+                                                            ways: speedLimitWays) {
+            match = full
+        } else {
+            currentLimitKmh = nil
+            isOverSpeedLimit = false
+            return
+        }
+        // Shadow guard: if the rider is on a road much closer than the
+        // matched tagged way, the limit belongs to a parallel road they're
+        // not on — drop it rather than show a wrong number. Same exact
+        // grid-then-full-scan rule, so the guard sees today's distances.
+        let nearestRoad = speedLimitRoadGrid?.nearestWithinWindow(to: fix.coordinate)?.distanceMeters
+            ?? SpeedLimitService.nearestRoadDistance(to: fix.coordinate,
+                                                     roads: speedLimitRoads)
+        if Self.isShadowed(matchDistance: match.distanceMeters, nearestRoad: nearestRoad) {
+            currentLimitKmh = nil
+            isOverSpeedLimit = false
+            return
+        }
+        // Hysteresis: acquire within snap, hold until beyond release.
+        let haveSign = currentLimitKmh != nil
+        let threshold = haveSign ? Self.limitReleaseMeters : Self.limitSnapMeters
+        if match.distanceMeters <= threshold {
+            currentLimitKmh = match.kmh
+            // Over-limit check using GPS speed (m/s → km/h). `fix.speed`
+            // is -1 when unknown; treat that as "not over".
+            if fix.speed >= 0 {
+                let speedKmh = fix.speed * 3.6
+                isOverSpeedLimit = speedKmh > Double(match.kmh) + speedLimitToleranceKmh
+            } else {
+                isOverSpeedLimit = false
+            }
+        } else {
+            currentLimitKmh = nil
+            isOverSpeedLimit = false
+        }
+    }
+
+    /// Pure shadow-guard decision: is the tagged match a parallel-road
+    /// artefact? True when there's a road meaningfully closer than the
+    /// matched way — closer by at least `shadowAbsMeters` AND by a factor
+    /// of at least `shadowRatio`. Both conditions guard against false
+    /// positives: a tiny absolute gap (roads running side by side) or a big
+    /// ratio at trivial distances (0.1 m vs 0.3 m) won't trip it. `nil`
+    /// nearestRoad (no road geometry loaded) never shadows. `nonisolated
+    /// static` so it mirrors 1:1 in the Python test.
+    nonisolated static func isShadowed(matchDistance: Double,
+                                       nearestRoad: Double?) -> Bool {
+        guard let road = nearestRoad else { return false }
+        guard road < matchDistance - shadowAbsMeters else { return false }
+        return matchDistance >= road * shadowRatio
+    }
+
+    /// Whether the limit sign should draw this frame, given the mode and
+    /// the current match/over-limit state.
+    private var shouldDrawSpeedLimit: Bool {
+        guard let _ = currentLimitKmh else { return false }
+        switch speedLimitMode {
+        case "always":   return true
+        case "overOnly": return isOverSpeedLimit
+        default:         return false   // "off"
+        }
+    }
+
+    // MARK: Weather pill
+
+    fileprivate func drawWeatherAlert(into ctx: CGContext) {
+        guard let alert = weatherAlert else { return }
+
+        let accent: CGColor = alert.severity == .warning
+            ? CGColor(red: 0.93, green: 0.20, blue: 0.18, alpha: 1.0)   // red
+            : CGColor(red: 1.00, green: 0.66, blue: 0.05, alpha: 1.0)   // amber
+
+        // Layout constants. Glyph box + gap + text, inside a dark pill with
+        // a coloured border so it reads over both light and dark tiles.
+        let margin: CGFloat = 12
+        let padX: CGFloat = 9
+        let glyphSize: CGFloat = 26
+        let gap: CGFloat = 7
+        var fontSize: CGFloat = 18
+        let pillH = Self.weatherPillHeight
+
+        // Compose the pill text: bare hazard noun, plus the along-route
+        // distance when the hazard is ahead (not at the rider). e.g.
+        // "Rain 15 km"; at the rider it's just "Rain". Decision #4.
+        let distText = alert.distanceAhead
+            .map { " " + Self.formatAheadDistance(meters: $0, imperial: weatherImperial) } ?? ""
+        var label = alert.title + distText
+
+        // Measure with the weight `drawText` actually draws, so the pill
+        // hugs the text.
+        let font = UIFont.systemFont(ofSize: fontSize, weight: Self.overlayTextWeight)
+        func measure(_ s: String) -> CGFloat {
+            (s as NSString).size(withAttributes: [.font: font]).width.rounded(.up)
+        }
+        var textW = measure(label)
+        let chromeW = padX + glyphSize + gap + padX
+
+        // Bottom-right anchor (Y-DOWN: bottom = large y).
+        // Collision avoidance: the speed-limit sign owns the bottom-right
+        // corner (it's the more persistent element). When it's showing,
+        // lift the weather pill to sit ABOVE the sign instead of on top of
+        // it. The sign is a `signDiameter` disc at the same margin, so the
+        // pill's baseline moves up by the sign height + a small gap. The
+        // section panel shares the sign's row, so it lifts the pill too —
+        // even when the sign itself is hidden ("overOnly" / "off").
+        let signBump: CGFloat = (shouldDrawSpeedLimit || speedSection != nil)
+            ? Self.speedLimitSignDiameter + 8
+            : 0
+        // The route progress bar runs along the bottom edge up to x = 436,
+        // under the pill's left part, and its position chevron overhangs it.
+        // Lift the pill above that zone too, or the bar paints over the
+        // pill's bottom and the chevron over the text.
+        let barBump: CGFloat = rideProgress != nil
+            ? Self.progressBarZoneHeight + 4 - margin
+            : 0
+        let originY = frameSize.height - margin - pillH - max(signBump, barBump)
+        // Right edge: the frame margin, or the round glass where it cuts in
+        // (a lifted pill's top-right corner would be hidden).
+        let maxX = min(frameSize.width - margin,
+                       Self.visibleSpan(minY: originY, maxY: originY + pillH).upperBound)
+        // Left limit: the heading puck, in every layout. The pill never
+        // grows over or above it: that's the route ahead.
+        let maxTextW = maxX - (puckRect.maxX + Self.overlayClearance) - chromeW
+        // Too long ("Strong wind 100 km"): use the short hazard name
+        // ("Wind 100 km"); the glyph and colour still tell the kind.
+        if textW > maxTextW {
+            label = Self.weatherShortTitle(alert.title) + distText
+            textW = measure(label)
+        }
+        // Backstop: shrink the font. Short names fit at full size.
+        if textW > maxTextW {
+            fontSize *= maxTextW / textW
+            textW = maxTextW
+        }
+        let pillW = chromeW + textW
+        let pill = CGRect(x: maxX - pillW, y: originY, width: pillW, height: pillH)
+
+        // Backdrop: solid black, 1.5 px coloured border. Solid, not
+        // translucent: a map moving under the text makes the encoder re-code
+        // it every frame at 512 kbps (rider: "Dense fog" hard to read). On
+        // solid black the text macroblocks are mostly static between
+        // keyframes; edge blocks still straddle the map.
+        ctx.saveGState()
+        let path = CGPath(roundedRect: pill, cornerWidth: 9, cornerHeight: 9, transform: nil)
+        ctx.addPath(path)
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        ctx.fillPath()
+        ctx.addPath(path)
+        ctx.setStrokeColor(accent)
+        ctx.setLineWidth(1.5)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // Glyph, vertically centred in the pill.
+        let glyphOrigin = CGPoint(x: pill.minX + padX, y: pill.midY - glyphSize / 2)
+        ctx.saveGState()
+        ctx.translateBy(x: glyphOrigin.x, y: glyphOrigin.y)
+        drawWeatherGlyph(alert.glyph, in: ctx, size: glyphSize, tint: accent)
+        ctx.restoreGState()
+
+        // Label text (title + optional distance), vertically centred.
+        // Reuse the same CoreText helper the maneuver overlay uses (white +
+        // black stroke for contrast).
+        let textOrigin = CGPoint(x: pill.minX + padX + glyphSize + gap,
+                                 y: pill.midY - fontSize / 2 - 1)
+        Self.drawText(label, in: ctx, at: textOrigin,
+                      width: textW + 4, fontSize: fontSize, bold: true)
+    }
+
+    /// One-word hazard name for a weather pill too long to fit beside the
+    /// heading puck. Titles from `WeatherAlertService`; unknown ones pass
+    /// through.
+    fileprivate static func weatherShortTitle(_ title: String) -> String {
+        switch title {
+        case "Heavy rain": return "Rain"
+        case "Heavy snow": return "Snow"
+        case "Strong wind", "Gusty wind", "Crosswind": return "Wind"
+        case "Dense fog": return "Fog"
+        case "Frost risk": return "Frost"
+        default: return title
+        }
+    }
+
+    /// Draw the active notice ("You've arrived", warnings, etc.). No-op when
+    /// none is active or the current one has expired (time-based
+    /// auto-dismiss — clears the stored notice on the way out). Rendered in
+    /// the flat outer ctx (Y-DOWN, top-left origin), centred above the
+    /// dash's turn card, so it's independent of map rotation/zoom like the
+    /// other overlays.
+    fileprivate func drawNotice(into ctx: CGContext) {
+        guard let active = activeNotice else { return }
+        guard Date() < active.expiresAt else {
+            activeNotice = nil   // expired → clear + draw nothing this frame
+            return
+        }
+        let notice = active.notice
+        let accent = notice.level.accent
+
+        // Layout: [glyph] gap [text] inside a padded rounded card.
+        let glyphSize: CGFloat = 30
+        let gap: CGFloat = 10
+        let padX: CGFloat = 16
+        let padY: CGFloat = 14
+        var fontSize: CGFloat = 22
+
+        let font = UIFont.systemFont(ofSize: fontSize, weight: Self.overlayTextWeight)
+        var textW = (notice.text as NSString)
+            .size(withAttributes: [.font: font]).width.rounded(.up)
+        // Sits just above the dash's own turn card, centred on the round
+        // glass — clear of the weather pill, which stays beside the puck.
+        let cardH = padY + max(glyphSize, fontSize) + padY
+        let originY = Self.navCardCenter.y - Self.navCardRadius - Self.overlayClearance - cardH
+        // Width-fit to the glass at that height, so a long notice shrinks
+        // instead of running off the visible area.
+        let span = Self.visibleSpan(minY: originY, maxY: originY + cardH)
+        let maxTextW = span.upperBound - span.lowerBound - (padX + glyphSize + gap + padX)
+        if textW > maxTextW {
+            fontSize *= maxTextW / textW
+            textW = maxTextW
+        }
+
+        let cardW = padX + glyphSize + gap + textW + padX
+        let originX = Self.visibleCenter.x - cardW / 2
+        let card = CGRect(x: originX, y: originY, width: cardW, height: cardH)
+
+        // Backdrop: solid black, 2 px accent border — solid for the same
+        // encoder reason as the weather pill.
+        ctx.saveGState()
+        let path = CGPath(roundedRect: card, cornerWidth: 12, cornerHeight: 12, transform: nil)
+        ctx.addPath(path)
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        ctx.fillPath()
+        ctx.addPath(path)
+        ctx.setStrokeColor(accent)
+        ctx.setLineWidth(2.0)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // Glyph, vertically centred.
+        let glyphOrigin = CGPoint(x: card.minX + padX, y: card.midY - glyphSize / 2)
+        ctx.saveGState()
+        ctx.translateBy(x: glyphOrigin.x, y: glyphOrigin.y)
+        drawNoticeGlyph(notice.level, in: ctx, size: glyphSize)
+        ctx.restoreGState()
+
+        // Text, vertically centred.
+        let textOrigin = CGPoint(x: card.minX + padX + glyphSize + gap,
+                                 y: card.midY - fontSize / 2 - 1)
+        Self.drawText(notice.text, in: ctx, at: textOrigin,
+                      width: textW + 4, fontSize: fontSize, bold: true)
+    }
+
+    /// Draw the severity glyph in a `size`×`size` box at the current ctx
+    /// origin (caller has translated). Y-DOWN (top-left origin).
+    ///   - .info     → filled blue circle + white "i"
+    ///   - .warning  → filled amber triangle + white "!"
+    ///   - .critical → filled red circle + white "x"
+    private func drawNoticeGlyph(_ level: DashNoticeLevel,
+                                 in ctx: CGContext, size s: CGFloat) {
+        let accent = level.accent
+        let white = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
+        ctx.setFillColor(accent)
+
+        switch level {
+        case .info, .critical:
+            ctx.fillEllipse(in: CGRect(x: 0, y: 0, width: s, height: s))
+        case .warning:
+            // Upward triangle (apex top in Y-DOWN = small y).
+            ctx.beginPath()
+            ctx.move(to: CGPoint(x: s * 0.5, y: s * 0.06))
+            ctx.addLine(to: CGPoint(x: s * 0.96, y: s * 0.92))
+            ctx.addLine(to: CGPoint(x: s * 0.04, y: s * 0.92))
+            ctx.closePath()
+            ctx.fillPath()
+        }
+
+        // Symbol, white, centred in the shape. Use CoreText via drawText for
+        // "i"/"!"; draw the "x" as two strokes so it reads crisply small.
+        switch level {
+        case .info:
+            Self.drawText("i", in: ctx,
+                          at: CGPoint(x: s * 0.5 - s * 0.10, y: s * 0.22),
+                          width: s, fontSize: s * 0.60, bold: true)
+        case .warning:
+            Self.drawText("!", in: ctx,
+                          at: CGPoint(x: s * 0.5 - s * 0.08, y: s * 0.30),
+                          width: s, fontSize: s * 0.52, bold: true)
+        case .critical:
+            ctx.setStrokeColor(white)
+            ctx.setLineWidth(max(2.0, s * 0.10))
+            ctx.setLineCap(.round)
+            let inset = s * 0.30
+            ctx.move(to: CGPoint(x: inset, y: inset))
+            ctx.addLine(to: CGPoint(x: s - inset, y: s - inset))
+            ctx.move(to: CGPoint(x: s - inset, y: inset))
+            ctx.addLine(to: CGPoint(x: inset, y: s - inset))
+            ctx.strokePath()
+        }
+    }
+
+    /// Draw a weather pictograph in a `size`×`size` box whose origin is the
+    /// CURRENT ctx origin (caller has translated). Y-DOWN coordinates
+    /// (top-left origin) — silhouettes read fine either way. `tint` colours
+    /// the active element (rain streaks, bolt, flake); the cloud base is
+    /// light grey so it reads on the dark pill.
+    private func drawWeatherGlyph(_ glyph: WeatherAlert.Glyph,
+                                  in ctx: CGContext, size: CGFloat, tint: CGColor) {
+        let cloudGrey = CGColor(red: 0.86, green: 0.88, blue: 0.92, alpha: 1.0)
+        let s = size
+
+        func fillCloud() {
+            // Cloud = three overlapping discs on a flat base, upper-middle
+            // of the box so there's room for rain/flakes beneath.
+            ctx.setFillColor(cloudGrey)
+            let baseY = s * 0.30
+            ctx.fillEllipse(in: CGRect(x: s * 0.06, y: baseY + s * 0.06, width: s * 0.42, height: s * 0.42))
+            ctx.fillEllipse(in: CGRect(x: s * 0.30, y: baseY - s * 0.02, width: s * 0.46, height: s * 0.46))
+            ctx.fillEllipse(in: CGRect(x: s * 0.52, y: baseY + s * 0.08, width: s * 0.38, height: s * 0.38))
+            ctx.fill(CGRect(x: s * 0.14, y: baseY + s * 0.26, width: s * 0.66, height: s * 0.20))
+        }
+
+        switch glyph {
+        case .rain:
+            fillCloud()
+            ctx.setStrokeColor(tint)
+            ctx.setLineWidth(max(1.6, s * 0.07))
+            ctx.setLineCap(.round)
+            for i in 0..<3 {
+                let x = s * (0.28 + 0.22 * CGFloat(i))
+                ctx.move(to: CGPoint(x: x, y: s * 0.74))
+                ctx.addLine(to: CGPoint(x: x - s * 0.08, y: s * 0.94))
+            }
+            ctx.strokePath()
+
+        case .storm:
+            fillCloud()
+            // Lightning bolt — filled zig-zag.
+            ctx.setFillColor(tint)
+            ctx.beginPath()
+            ctx.move(to: CGPoint(x: s * 0.52, y: s * 0.70))
+            ctx.addLine(to: CGPoint(x: s * 0.40, y: s * 0.70))
+            ctx.addLine(to: CGPoint(x: s * 0.50, y: s * 0.86))
+            ctx.addLine(to: CGPoint(x: s * 0.42, y: s * 0.86))
+            ctx.addLine(to: CGPoint(x: s * 0.56, y: s * 1.00))
+            ctx.addLine(to: CGPoint(x: s * 0.50, y: s * 0.82))
+            ctx.addLine(to: CGPoint(x: s * 0.58, y: s * 0.82))
+            ctx.closePath()
+            ctx.fillPath()
+
+        case .snow:
+            fillCloud()
+            ctx.setFillColor(tint)
+            for i in 0..<3 {
+                let x = s * (0.30 + 0.20 * CGFloat(i))
+                ctx.fillEllipse(in: CGRect(x: x - s * 0.04, y: s * 0.80, width: s * 0.08, height: s * 0.08))
+            }
+
+        case .ice:
+            // Snowflake — 6 spokes from centre, no cloud.
+            ctx.setStrokeColor(tint)
+            ctx.setLineWidth(max(1.5, s * 0.06))
+            ctx.setLineCap(.round)
+            let cx = s * 0.5, cy = s * 0.5, r = s * 0.40
+            for k in 0..<6 {
+                let a = CGFloat(k) * .pi / 3
+                ctx.move(to: CGPoint(x: cx, y: cy))
+                ctx.addLine(to: CGPoint(x: cx + r * cos(a), y: cy + r * sin(a)))
+            }
+            ctx.strokePath()
+
+        case .fog:
+            // Three horizontal bars.
+            ctx.setStrokeColor(cloudGrey)
+            ctx.setLineWidth(max(1.8, s * 0.08))
+            ctx.setLineCap(.round)
+            for i in 0..<3 {
+                let y = s * (0.34 + 0.20 * CGFloat(i))
+                ctx.move(to: CGPoint(x: s * 0.16, y: y))
+                ctx.addLine(to: CGPoint(x: s * 0.84, y: y))
+            }
+            ctx.strokePath()
+
+        case .wind:
+            // Two swoosh lines with a little hook.
+            ctx.setStrokeColor(tint)
+            ctx.setLineWidth(max(1.8, s * 0.08))
+            ctx.setLineCap(.round)
+            ctx.beginPath()
+            ctx.move(to: CGPoint(x: s * 0.14, y: s * 0.40))
+            ctx.addCurve(to: CGPoint(x: s * 0.74, y: s * 0.34),
+                         control1: CGPoint(x: s * 0.50, y: s * 0.22),
+                         control2: CGPoint(x: s * 0.74, y: s * 0.18))
+            ctx.move(to: CGPoint(x: s * 0.14, y: s * 0.64))
+            ctx.addCurve(to: CGPoint(x: s * 0.66, y: s * 0.70),
+                         control1: CGPoint(x: s * 0.50, y: s * 0.82),
+                         control2: CGPoint(x: s * 0.66, y: s * 0.86))
+            ctx.strokePath()
+        }
+    }
+
+    // MARK: Alternative-route ETA bubbles
+
+    /// Draw an ETA-delta bubble ("+5 min" / "similar") for each alternative
+    /// route, geo-anchored to its `bubbleAnchor` but rendered UPRIGHT and
+    /// constant-size in the flat outer ctx — same hand-rolled projection as
+    /// `drawSpeedCameras` (forward bias → heading rotation → zoom → geo
+    /// delta). Bubbles whose anchor projects off-frame are culled.
+    fileprivate func drawAlternativeBubbles(into ctx: CGContext,
+                                            centerLat: Double, centerLon: Double,
+                                            pxPerDegLon: Double, pxPerDegLat: Double,
+                                            zoom: CGFloat) {
+        guard !alternativeRoutes.isEmpty else { return }
+        let theta = -lastHeading * .pi / 180.0
+        let cosT = cos(theta), sinT = sin(theta)
+        let biasPx = Double(frameSize.height) * Double(forwardBiasFraction)
+        let anchorX = Double(frameSize.width) / 2
+        let anchorY = Double(frameSize.height) / 2 + biasPx
+        let z = Double(zoom)
+        let w = Double(frameSize.width), h = Double(frameSize.height)
+
+        for alt in alternativeRoutes {
+            // Belt-and-braces: never draw a bubble for an alt whose line the
+            // renderer skips (< 2 points). `pushAlternativeRenders` already
+            // filters these at the source, but keeping the guards symmetric
+            // means a bubble can never orphan itself from its grey line
+            // regardless of how the render list was built.
+            guard alt.coords.count > 1 else { continue }
+            let c = alt.bubbleAnchor
+            let dx = (c.longitude - centerLon) * pxPerDegLon
+            let dy = -(c.latitude - centerLat) * pxPerDegLat   // Y-DOWN
+            let zx = dx * z, zy = dy * z
+            let rx = zx * cosT - zy * sinT
+            let ry = zx * sinT + zy * cosT
+            let sx = anchorX + rx
+            let sy = anchorY + ry
+            guard sx > -80, sx < w + 80, sy > -32, sy < h + 32 else { continue }
+            drawEtaBubble(into: ctx, at: CGPoint(x: sx, y: sy), label: alt.etaDeltaLabel)
+        }
+    }
+
+    /// One upright rounded pill centred at `p` carrying the ETA-delta text.
+    private func drawEtaBubble(into ctx: CGContext, at p: CGPoint, label: String) {
+        let fontSize: CGFloat = 18
+        let ink = UIColor(cgColor: currentStyle.alternativeBubbleInk)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: fontSize, weight: .bold),
+            .foregroundColor: ink,
+        ]
+        let attr = NSAttributedString(string: label, attributes: attrs)
+        let line = CTLineCreateWithAttributedString(attr)
+        // Measure with a nil context (bounds relative to the origin). With
+        // `ctx`, the bounds are offset by its current text position, which
+        // saveGState/restoreGState don't reset — whatever an earlier text
+        // draw in the frame left behind shifted the text out of the pill.
+        let textBounds = CTLineGetImageBounds(line, nil)
+        let padX: CGFloat = 9, padY: CGFloat = 5
+        let pillW = textBounds.width + padX * 2
+        let pillH = fontSize + padY * 2
+        let pill = CGRect(x: p.x - pillW / 2, y: p.y - pillH / 2,
+                          width: pillW, height: pillH)
+
+        ctx.saveGState()
+        // Pill background.
+        ctx.setFillColor(currentStyle.alternativeBubbleFill)
+        ctx.addPath(CGPath(roundedRect: pill, cornerWidth: pillH / 2,
+                           cornerHeight: pillH / 2, transform: nil))
+        ctx.fillPath()
+        // Glyph box centred on `p` (baseline placed from the measured ink
+        // bounds, not a font-size guess). The outer buffer is Y-DOWN; flip
+        // locally so CoreText draws upright.
+        ctx.textMatrix = .identity
+        ctx.translateBy(x: p.x - textBounds.midX,
+                        y: p.y + textBounds.midY)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.textPosition = .zero
+        CTLineDraw(line, ctx)
+        ctx.restoreGState()
+    }
+
+    // MARK: Speed cameras
+
+    /// Plot each speed camera at its projected screen position. Re-applies
+    /// the SAME composite transform the tile/polyline path uses (forward
+    /// bias → heading rotation → zoom → geo-delta in px), computed by hand
+    /// so we can then draw the icon UPRIGHT in the flat outer ctx. Cameras
+    /// whose projected position falls outside the frame (+ margin) are
+    /// culled.
+    fileprivate func drawSpeedCameras(into ctx: CGContext,
+                                      centerLat: Double, centerLon: Double,
+                                      pxPerDegLon: Double, pxPerDegLat: Double,
+                                      zoom: CGFloat) {
+        guard !speedCameras.isEmpty else { return }
+
+        let theta = -lastHeading * .pi / 180.0
+        let cosT = cos(theta), sinT = sin(theta)
+        // Keep the whole projection in Double; CGFloat↔Double don't mix
+        // implicitly in Swift, and the geo-deltas are already Double. We
+        // narrow to CGFloat only at the final CGPoint.
+        let biasPx = Double(frameSize.height) * Double(forwardBiasFraction)
+        let anchorX = Double(frameSize.width) / 2
+        let anchorY = Double(frameSize.height) / 2 + biasPx
+        // `zoom` is the effective DRAW zoom (currentZoom × layerScale) so
+        // markers land on the route regardless of which quality layer's
+        // tile — and thus which pxPerDeg — supplied this frame.
+        let z = Double(zoom)
+        let w = Double(frameSize.width), h = Double(frameSize.height)
+
+        for cam in speedCameras {
+            // Geo-delta in unrotated pixels (same formula as the polyline).
+            let dx = (cam.coordinate.longitude - centerLon) * pxPerDegLon
+            let dy = -(cam.coordinate.latitude - centerLat) * pxPerDegLat  // Y-DOWN: north = -y
+            // Apply zoom, then the heading rotation (CGAffineTransform
+            // rotation matrix), then the anchor translate. This reproduces
+            // ctx.translate(anchor) · rotate(theta) · scale(z) acting on
+            // the point — i.e. exactly where the tile path would put it.
+            let zx = dx * z, zy = dy * z
+            let rx = zx * cosT - zy * sinT
+            let ry = zx * sinT + zy * cosT
+            let sx = anchorX + rx
+            let sy = anchorY + ry
+
+            // Cull off-frame markers. The margin must clear the enlarged
+            // disc (r=15); the extra horizontal slack is left over from the
+            // since-removed speed pill to its right.
+            guard sx > -72, sx < w + 72,
+                  sy > -28, sy < h + 28 else { continue }
+
+            drawCameraMarker(into: ctx, at: CGPoint(x: sx, y: sy), camera: cam)
+        }
+    }
+
+    /// One upright camera marker centred at screen point `p` (Y-DOWN outer
+    /// ctx). A disc in the camera's accent colour with a camera body cut
+    /// into it. Section/average-speed cameras get a violet accent to set
+    /// them apart from spot cameras (red).
+    private func drawCameraMarker(into ctx: CGContext, at p: CGPoint, camera: SpeedCamera) {
+        let accent: CGColor = camera.isSection
+            ? CGColor(red: 0.55, green: 0.30, blue: 0.85, alpha: 1.0)   // violet — section
+            : CGColor(red: 0.90, green: 0.16, blue: 0.16, alpha: 1.0)   // red — spot
+
+        ctx.saveGState()
+        ctx.translateBy(x: p.x, y: p.y)
+
+        // Marker disc (with white outline for contrast over any tile).
+        // Enlarged from r=11 to r=15 on rider feedback (6/2026: "make the
+        // icon bigger") — easier to spot at a glance on the dash.
+        let r: CGFloat = 15
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fillEllipse(in: CGRect(x: -r - 2, y: -r - 2, width: (r + 2) * 2, height: (r + 2) * 2))
+        ctx.setFillColor(accent)
+        ctx.fillEllipse(in: CGRect(x: -r, y: -r, width: r * 2, height: r * 2))
+
+        // Camera body (white): a rounded rect + a lens circle + a small
+        // viewfinder bump, all inside the disc. Scaled with the disc.
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        let body = CGRect(x: -10, y: -6.5, width: 20, height: 13)
+        ctx.addPath(CGPath(roundedRect: body, cornerWidth: 3, cornerHeight: 3, transform: nil))
+        ctx.fillPath()
+        // viewfinder bump on top-left
+        ctx.fill(CGRect(x: -8, y: -9.5, width: 5.5, height: 3.5))
+        // lens hole (accent shows through)
+        ctx.setFillColor(accent)
+        ctx.fillEllipse(in: CGRect(x: -3.8, y: -3.8, width: 7.6, height: 7.6))
+
+        ctx.restoreGState()
+
+        // The speed number that used to sit on a pill to the right of the
+        // marker was removed on rider feedback (8/2026: "the number next to
+        // the camera looks ugly — drop the speed, keep just the camera
+        // icon"). The posted limit still shows on the dedicated speed-limit
+        // roundel; the camera marker is now the pictograph alone, which
+        // reads far cleaner on the small dash after H.264 subsampling.
+    }
+
+    /// Convert an internal km/h limit to the number shown to the rider,
+    /// honouring the imperial units setting. Used by the posted-limit sign
+    /// (the camera marker no longer shows a number). Like a real road sign, the caller renders the bare
+    /// number — the disc shape / context conveys the unit.
+    fileprivate static func displayLimit(kmh: Int, imperial: Bool) -> Int {
+        imperial ? Int((Double(kmh) / 1.609344).rounded()) : kmh
+    }
+
+    // MARK: Speed-limit sign
+
+    /// Outer diameter (px) of the speed-limit sign disc. Exposed as a
+    /// constant so the weather pill can hop above it on a collision.
+    fileprivate static let speedLimitSignDiameter: CGFloat = 62
+    /// Margin (px) from the frame edges, matched to the weather pill.
+    fileprivate static let speedLimitSignMargin: CGFloat = 12
+
+    /// Draw the posted speed-limit sign in the bottom-right corner: a
+    /// European circular sign — white field, thick red ring, black number.
+    /// Transform-independent (flat outer ctx) so it sits in a fixed screen
+    /// spot regardless of map rotation/zoom, exactly like the weather pill.
+    /// No-op unless `shouldDrawSpeedLimit`.
+    fileprivate func drawSpeedLimitSign(into ctx: CGContext) {
+        guard shouldDrawSpeedLimit, let kmh = currentLimitKmh else { return }
+
+        // Value + (no) unit. A real road sign carries no unit text — the
+        // disc shape IS the unit — so we show the bare number. Imperial
+        // riders see the mph-converted number (OSM maxspeed is km/h), via
+        // the shared `displayLimit` helper.
+        let value = Self.displayLimit(kmh: kmh, imperial: speedLimitImperial)
+        let label = "\(value)"
+
+        let d = Self.speedLimitSignDiameter
+        let margin = Self.speedLimitSignMargin
+        let r = d / 2
+        // Bottom-right anchor (Y-DOWN: bottom = large y).
+        let cx = frameSize.width - margin - r
+        let cy = frameSize.height - margin - r
+
+        ctx.saveGState()
+
+        // Soft drop shadow so the sign lifts off busy map tiles.
+        ctx.setShadow(offset: CGSize(width: 0, height: 1),
+                      blur: 3, color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.55))
+
+        // White field (full disc).
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fillEllipse(in: CGRect(x: cx - r, y: cy - r, width: d, height: d))
+        ctx.setShadow(offset: .zero, blur: 0, color: nil)   // shadow only on the base disc
+
+        // Red ring: drawn as a stroked circle whose line width is the ring
+        // thickness (~16% of the diameter, like the real sign).
+        let ringW = d * 0.16
+        let ringR = r - ringW / 2 - 1   // inset so the stroke stays inside the disc
+        ctx.setStrokeColor(CGColor(red: 0.86, green: 0.12, blue: 0.12, alpha: 1.0))
+        ctx.setLineWidth(ringW)
+        ctx.strokeEllipse(in: CGRect(x: cx - ringR, y: cy - ringR,
+                                     width: ringR * 2, height: ringR * 2))
+
+        ctx.restoreGState()
+
+        // Black number, centred in the white field. The glyphs must clear
+        // the red ring for ANY value — a wide 2-digit limit like "90" or a
+        // 3-digit "130" — so instead of a fixed font fraction (which scales
+        // WITH the disc and so always kept the same ring overlap) we
+        // width-fit: start from a comfortable size and shrink to the inner
+        // white field if the measured text would touch the ring. Fixes the
+        // "90 kisses the ring" report (rider feedback 6/2026).
+        let innerFieldD = d - 2 * ringW          // white field inside the ring
+        let maxTextWidth = innerFieldD * 0.72    // headroom for the round ring
+        var fontSize: CGFloat = d * 0.50
+        var font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
+        var textSize = (label as NSString).size(withAttributes: [.font: font])
+        if textSize.width > maxTextWidth {
+            fontSize *= maxTextWidth / textSize.width
+            font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
+            textSize = (label as NSString).size(withAttributes: [.font: font])
+        }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: UIColor.black,
+        ]
+        let textOrigin = CGPoint(x: cx - textSize.width / 2,
+                                 y: cy - textSize.height / 2)
+        UIGraphicsPushContext(ctx)
+        (label as NSString).draw(at: textOrigin, withAttributes: attrs)
+        UIGraphicsPopContext()
+    }
+
+    // MARK: - Average-speed section panel
+
+    /// Panel size (px). Sits in the sign's row, left of the sign's slot
+    /// (always the same spot, sign shown or not), top-aligned 2 px above
+    /// the sign so its bottom clears the progress-bar marker (top at y=276).
+    /// Measured against the round dash glass: the panel's outer corner is
+    /// ~80 px inside the visible circle.
+    fileprivate static let sectionPanelSize = CGSize(width: 110, height: 48)
+    fileprivate static let sectionPanelGap: CGFloat = 8
+
+    /// "Ø 74 km/h" + a progress mini-bar + "630 m" left. White figure under
+    /// the limit, red figure / border / bar over it (same tolerance as the
+    /// sign). Limit = the section's own `maxspeed`, else the matched road.
+    fileprivate func drawSpeedSectionPanel(into ctx: CGContext) {
+        guard let r = speedSection else { return }
+
+        let size = Self.sectionPanelSize
+        let margin = Self.speedLimitSignMargin
+        let signTop = frameSize.height - margin - Self.speedLimitSignDiameter
+        let panel = CGRect(
+            x: frameSize.width - margin - Self.speedLimitSignDiameter - Self.sectionPanelGap - size.width,
+            y: signTop - 2,
+            width: size.width, height: size.height)
+
+        let limit = r.limitKmh ?? currentLimitKmh
+        var over = false
+        if let avg = r.averageKmh, let limit {
+            over = avg > Double(limit) + speedLimitToleranceKmh
+        }
+        let red = CGColor(red: 0.93, green: 0.20, blue: 0.18, alpha: 1)
+        let grey = CGColor(red: 0.62, green: 0.64, blue: 0.67, alpha: 1)
+        let accent = over ? red : grey
+
+        // Backdrop — same look as the weather pill (solid, see there).
+        ctx.saveGState()
+        let path = CGPath(roundedRect: panel, cornerWidth: 9, cornerHeight: 9, transform: nil)
+        ctx.addPath(path)
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+        ctx.fillPath()
+        ctx.addPath(path)
+        ctx.setStrokeColor(accent)
+        ctx.setLineWidth(over ? 2 : 1.5)
+        ctx.strokePath()
+
+        // Mini-bar: share of the section already ridden.
+        let padX: CGFloat = 8
+        let barRect = CGRect(x: panel.minX + padX, y: panel.maxY - 13, width: 40, height: 5)
+        let done = r.lengthMeters > 0
+            ? CGFloat(max(0, min(1, 1 - r.remainingMeters / r.lengthMeters))) : 0
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.25))
+        ctx.fill(barRect)
+        ctx.setFillColor(over ? red : CGColor(red: 1, green: 1, blue: 1, alpha: 0.9))
+        ctx.fill(CGRect(x: barRect.minX, y: barRect.minY, width: barRect.width * done, height: barRect.height))
+        ctx.restoreGState()
+
+        // Text. Average in the rider's units; "--" for the first seconds.
+        let unit = speedLimitImperial ? "mph" : "km/h"
+        let avgText = r.averageKmh.map {
+            "Ø \(Int((speedLimitImperial ? $0 / 1.609344 : $0).rounded()))"
+        } ?? "Ø --"
+        // Fine-grained countdown — sections are 0.2–2.5 km, so the pill's
+        // "1 km" / 500 ft steps would hide most of it. Metres to the nearest
+        // 10; imperial feet to the nearest 50 below 0.2 mi, then 0.1 mi.
+        let remText: String
+        if speedLimitImperial {
+            let ft = r.remainingMeters * 3.280839895
+            remText = ft < 1056
+                ? "\(Int((ft / 50).rounded()) * 50) ft"
+                : String(format: "%.1f mi", r.remainingMeters / 1609.344)
+        } else {
+            remText = "\(Int((r.remainingMeters / 10).rounded()) * 10) m"
+        }
+
+        let white = UIColor.white
+        var big: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 22, weight: .bold),
+            .foregroundColor: over ? UIColor(cgColor: red) : white,
+        ]
+        let small: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: white.withAlphaComponent(0.85),
+        ]
+        // Width-fit the top row ("Ø 130 km/h" is the widest) — same idea
+        // as the sign's number fit.
+        let rowW = (avgText as NSString).size(withAttributes: big).width + 4
+            + (unit as NSString).size(withAttributes: small).width
+        let maxRowW = size.width - 2 * padX
+        if rowW > maxRowW {
+            big[.font] = UIFont.systemFont(ofSize: 22 * maxRowW / rowW, weight: .bold)
+        }
+        let rem: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 13, weight: .semibold),
+            .foregroundColor: white,
+        ]
+        UIGraphicsPushContext(ctx)
+        let avgSize = (avgText as NSString).size(withAttributes: big)
+        (avgText as NSString).draw(at: CGPoint(x: panel.minX + padX, y: panel.minY + 2), withAttributes: big)
+        (unit as NSString).draw(at: CGPoint(x: panel.minX + padX + avgSize.width + 4, y: panel.minY + 11),
+                                withAttributes: small)
+        let remSize = (remText as NSString).size(withAttributes: rem)
+        (remText as NSString).draw(at: CGPoint(x: panel.maxX - padX - remSize.width,
+                                               y: barRect.midY - remSize.height / 2),
+                                   withAttributes: rem)
+        UIGraphicsPopContext()
+    }
+
+    // MARK: - Route progress bar
+
+    /// Height (px) of the bottom-edge progress bar. Thin — a sleek HUD
+    /// accent, not a chunky UI element, on the 526×300 dash.
+    fileprivate static let progressBarHeight: CGFloat = 6
+
+    /// Fraction of the dash width the bar spans. Centred and kept short so
+    /// it doesn't collide with the weather / speed-limit pills near the
+    /// edges — 66% leaves generous margins on both sides.
+    ///
+    /// NOTE: only used as a fallback. The bar is normally laid out with the
+    /// explicit asymmetric margins below so its LEFT end clears the dash's
+    /// own maneuver glyph (bottom-left turn card), which was overlapping the
+    /// start of a centred bar (rider photo, 8/2026).
+    fileprivate static let progressBarWidthFraction: CGFloat = 0.66
+
+    /// Left inset (px) of the progress bar. The Tripper dash draws its own
+    /// turn card over the bottom-left (`navCardCenter` / `navCardRadius`).
+    /// At the bar's height (y 275–295) that disc plus `overlayClearance`
+    /// reaches x ≈ 134; the position chevron overhangs the bar's start by
+    /// 12 px, so the bar starts at 146 and the done/grey end is never
+    /// hidden under the card.
+    fileprivate static let progressBarLeftInset: CGFloat = 146
+
+    /// Right inset (px) of the progress bar — matches the old centred bar's
+    /// right margin so the ahead/blue end still clears the bottom-right
+    /// weather / speed-limit pills.
+    fileprivate static let progressBarRightInset: CGFloat = 90
+
+    /// Gap (px) between the bar and the bottom edge, so the marker fits.
+    fileprivate static let progressBarBottomMargin: CGFloat = 12
+
+    /// Half-height (px) of the position chevron; it overhangs the bar.
+    fileprivate static let progressMarkerHalfHeight: CGFloat = 9
+
+    /// Height (px) from the bottom edge that the bar + chevron (+ its 2-px
+    /// stroke) occupy. Bottom-row overlays (weather pill) sit above it.
+    fileprivate static var progressBarZoneHeight: CGFloat {
+        progressBarBottomMargin + progressBarHeight / 2 + progressMarkerHalfHeight + 1
+    }
+
+    // MARK: Dash geometry (docs/dash-visible-area.md, measured ±3 px)
+
+    /// The dash's round glass shows only this circle of the 526×300 frame.
+    static let visibleCenter = CGPoint(x: 262, y: 263)
+    static let visibleRadius: CGFloat = 264
+    /// While navigating, the dash draws its own turn card (glyph +
+    /// distance) over the stream as this disc.
+    static let navCardCenter = CGPoint(x: 79, y: 228)
+    static let navCardRadius: CGFloat = 68
+    /// Gap (px) fixed overlays keep from the glass edge, the turn card and
+    /// the heading puck — covers the ±3 px measurement error.
+    fileprivate static let overlayClearance: CGFloat = 4
+    /// Height (px) of the weather pill; the notice card stacks above it.
+    fileprivate static let weatherPillHeight: CGFloat = 40
+
+    /// Visible x range, inset by `overlayClearance`, that holds for every
+    /// row in `minY...maxY` — i.e. at the row farthest from the circle's
+    /// centre. A rect inside it is fully on the glass.
+    fileprivate static func visibleSpan(minY: CGFloat, maxY: CGFloat) -> ClosedRange<CGFloat> {
+        let dy = max(abs(minY - visibleCenter.y), abs(maxY - visibleCenter.y))
+        let r = visibleRadius - overlayClearance
+        let half = max(0, r * r - dy * dy).squareRoot()
+        return (visibleCenter.x - half)...(visibleCenter.x + half)
+    }
+
+    /// Draw the ride-progress bar along the BOTTOM EDGE between the left/
+    /// right insets (centred 66% fallback). DONE portion (left) is grey; the REMAINING
+    /// portion (right) is blue; a downward arrow marker sits above the
+    /// current position. No traffic tint — we have no per-segment live
+    /// traffic, so the bar makes no green/amber/red claim (a BYOK provider
+    /// would be needed; see routing-engines.md). Transform-independent —
+    /// called on the flat outer `ctx` after the map is composited, in
+    /// Y-DOWN pixel space, exactly like the pills/sign. No-op unless the
+    /// nav pump pushed a `rideProgress` (feature off / not navigating).
+    fileprivate func drawProgressBar(into ctx: CGContext) {
+        guard let p = rideProgress else { return }
+
+        let h = Self.progressBarHeight
+        // Asymmetric layout: LEFT inset clears the dash's own maneuver glyph
+        // (bottom-left turn card), RIGHT inset clears the bottom-right pills.
+        // Fall back to a centred 66% bar if the insets don't fit the frame
+        // (shouldn't happen at 526 px, but keeps the bar sane on any size).
+        var x0 = Self.progressBarLeftInset
+        var barW = frameSize.width - Self.progressBarLeftInset - Self.progressBarRightInset
+        if barW < 80 {
+            barW = (frameSize.width * Self.progressBarWidthFraction).rounded()
+            x0 = ((frameSize.width - barW) / 2).rounded()
+        }
+        x0 = x0.rounded()
+        barW = barW.rounded()
+        let y = frameSize.height - h - Self.progressBarBottomMargin   // Y-DOWN
+        let frac = CGFloat(max(0, min(1, p.fraction)))
+        let splitX = x0 + (barW * frac).rounded()
+
+        // Colours.
+        let doneGrey = CGColor(red: 0.55, green: 0.57, blue: 0.60, alpha: 0.95)
+        let aheadBlue = CGColor(red: 0.16, green: 0.52, blue: 0.96, alpha: 0.98)
+
+        let barRect = CGRect(x: x0, y: y, width: barW, height: h)
+        let radius = h / 2                         // fully rounded (pill) ends
+        let pill = CGPath(roundedRect: barRect, cornerWidth: radius,
+                          cornerHeight: radius, transform: nil)
+
+        ctx.saveGState()
+
+        // Clip everything that follows to the rounded pill so the fills and
+        // the split inherit the rounded ends.
+        ctx.addPath(pill)
+        ctx.clip()
+
+        // DONE portion (left) — grey.
+        if splitX > x0 {
+            ctx.setFillColor(doneGrey)
+            ctx.fill(CGRect(x: x0, y: y, width: splitX - x0, height: h))
+        }
+
+        // ROAD-AHEAD portion (right) — blue.
+        if splitX < x0 + barW {
+            ctx.setFillColor(aheadBlue)
+            ctx.fill(CGRect(x: splitX, y: y, width: x0 + barW - splitX, height: h))
+        }
+
+        // Weather-hazard band — a coloured segment marking WHERE on the
+        // route a known hazard sits (e.g. rain 15 km ahead). Amber for a
+        // caution, red for a warning. Drawn over the blue ahead-fill (a
+        // hazard is by definition ahead of the current split), clipped to
+        // the pill, wide enough to read on the 526-px dash. Centred on the
+        // hazard fraction. Only when we actually located a hazard.
+        if let hf = p.hazardFraction {
+            let hazardColor: CGColor = p.hazardIsWarning
+                ? CGColor(red: 0.93, green: 0.20, blue: 0.18, alpha: 1.0)   // red
+                : CGColor(red: 1.0,  green: 0.60, blue: 0.0,  alpha: 1.0)   // amber
+            ctx.setFillColor(hazardColor)
+            if let sf = p.hazardStartFraction, let ef = p.hazardEndFraction, ef > sf {
+                // Contiguous stretch: paint the whole band from the near edge
+                // to the far edge (e.g. rain from 15 km to 40 km ahead).
+                let sfc = CGFloat(max(0, min(1, sf)))
+                let efc = CGFloat(max(0, min(1, ef)))
+                let sx = x0 + barW * sfc
+                let ex = x0 + barW * efc
+                // Keep a minimum width so a thin span still reads.
+                let w = max(ex - sx, 6)
+                let bx = max(x0, min(sx, x0 + barW - w))
+                ctx.fill(CGRect(x: bx, y: y, width: min(w, x0 + barW - bx), height: h))
+            } else {
+                // Point hazard: a single glanceable band at the position.
+                let hfc = CGFloat(max(0, min(1, hf)))
+                let bandW: CGFloat = 10                       // px, glanceable
+                let cx = x0 + barW * hfc
+                let bx = max(x0, min(cx - bandW / 2, x0 + barW - bandW))
+                ctx.fill(CGRect(x: bx, y: y, width: bandW, height: h))
+            }
+        }
+
+        // Waypoint ticks are drawn AFTER the clip is dropped (below) so
+        // their overhang above/below the bar isn't clipped away.
+
+        // Drop the clip so the outline stroke and the overhanging waypoint
+        // ticks sit ON / around the pill edge.
+        ctx.resetClip()
+
+        // Waypoint ticks — a bright notch at each intermediate via-point so
+        // the rider can see the stops laid out along the whole trip. These
+        // used to be a 1.5 px dark hairline that was practically invisible
+        // (rider feedback, 8/2026); now they're a white tick with a dark
+        // outline that OVERHANGS the bar top and bottom so they stand out
+        // against both the grey and blue halves. The final destination
+        // isn't in the list (it's the bar's end). Drawn UNCLIPPED so the
+        // overhang shows.
+        let tickW: CGFloat = 3
+        let tickOverhang: CGFloat = 3                 // sticks out above/below
+        for wf in p.waypointFractions {
+            let f = CGFloat(max(0, min(1, wf)))
+            let tx = (x0 + barW * f).rounded()
+            guard tx > x0 + tickW, tx < x0 + barW - tickW else { continue }
+            let tickRect = CGRect(x: tx - tickW / 2, y: y - tickOverhang,
+                                  width: tickW, height: h + tickOverhang * 2)
+            // Dark outline (slightly larger) first, then white core.
+            ctx.setFillColor(CGColor(red: 0.08, green: 0.10, blue: 0.13, alpha: 0.95))
+            ctx.fill(tickRect.insetBy(dx: -1, dy: -1))
+            ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 0.98))
+            ctx.fill(tickRect)
+        }
+
+        // Thin black outline tracing the rounded bar.
+        ctx.addPath(pill)
+        ctx.setStrokeColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0.9))
+        ctx.setLineWidth(1)
+        ctx.strokePath()
+
+        // Position marker — a red RIGHT-pointing chevron sitting at the
+        // split, vertically centred on the bar and taller than it, lined
+        // with thin white so it pops off the map and the bar. Shaped like
+        // the heading puck's chevron: a back NOTCH cut into the trailing
+        // edge so it reads as an arrow, not a plain triangle.
+        let markX = min(max(x0, splitX), x0 + barW)
+        let midY = y + h / 2
+        let arrowW: CGFloat = 11           // depth from back edge to tip
+        let arrowHalfH = Self.progressMarkerHalfHeight   // overhangs the bar
+        let notch: CGFloat = 5             // how deep the back notch bites in
+        let chevron = CGMutablePath()
+        chevron.move(to: CGPoint(x: markX + arrowW, y: midY))                 // tip (points right)
+        chevron.addLine(to: CGPoint(x: markX - arrowW, y: midY - arrowHalfH)) // top-back corner
+        chevron.addLine(to: CGPoint(x: markX - arrowW + notch, y: midY))      // back notch (bite in)
+        chevron.addLine(to: CGPoint(x: markX - arrowW, y: midY + arrowHalfH)) // bottom-back corner
+        chevron.closeSubpath()
+
+        // White outline first (stroked wider), then the red fill on top.
+        ctx.addPath(chevron)
+        ctx.setStrokeColor(CGColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0))
+        ctx.setLineWidth(2)
+        ctx.setLineJoin(.round)
+        ctx.strokePath()
+
+        ctx.addPath(chevron)
+        ctx.setFillColor(CGColor(red: 0.91, green: 0.20, blue: 0.17, alpha: 1.0))
+        ctx.fillPath()
+
+        ctx.restoreGState()
+    }
+}

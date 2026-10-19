@@ -1,0 +1,2033 @@
+//
+//  AppStatus.swift
+//  TripperDashPP
+//
+//  Shared application state — observable, injected as @Environment.
+//
+
+import CoreImage
+import CoreLocation
+import Foundation
+import MapKit
+import Observation
+import os
+import UIKit
+
+private let shareLog = Logger(subsystem: "eu.kolaczek.tripperdashpp", category: "ShareIntake")
+
+/// High-level connection lifecycle as seen by the UI. Mirrors the
+/// `BikeLink` state machine.
+enum BikeConnectionState: String, Sendable {
+    case disconnected
+    case wifiJoining       // Joining the Tripper AP / opening the link
+    case handshaking       // RSA exchange in flight
+    case reconnecting      // Link dropped after being connected; retrying
+    case connected         // Heartbeats flowing, no video yet
+    case streaming         // RTP video in flight
+    case error             // See AppStatus.lastError
+}
+
+/// Live counters from the encoder + RTP packetizer (Phase 4).
+struct StreamMetrics: Sendable, Equatable {
+    var encodedFps: Double = 0
+    var kbpsOut: Double = 0
+    var packetsSent: UInt64 = 0
+    var packetsDropped: UInt64 = 0
+    var nalsEmitted: UInt64 = 0
+    var idrCount: UInt64 = 0
+    var lastError: String?
+
+    static let zero = StreamMetrics()
+}
+
+// Phase 7: `Destination` lives in Navigation/Models/Destination.swift —
+// the old placeholder here was removed when the real model arrived.
+
+@MainActor
+@Observable
+final class AppStatus {
+
+    // MARK: - Connection
+
+    /// Live K1G control-plane orchestrator. Phase 3+ reads `bikeLink.state`
+    /// and mirrors it into `connectionState` for the UI.
+    let bikeLink: BikeLink = BikeLink()
+
+    /// Joins the phone to a Tripper's Wi-Fi AP from inside the app (paid
+    /// Hotspot Configuration entitlement). Used to register the network when
+    /// a bike is added and to auto-join it right before connecting.
+    let wifiJoiner = WiFiJoiner()
+
+    /// Computed view of the link state in UI-friendly terms.
+    var connectionState: BikeConnectionState {
+        if streamer?.state == .running { return .streaming }
+        switch bikeLink.state {
+        case .idle:         return .disconnected
+        case .connecting:   return .wifiJoining
+        case .handshaking:  return .handshaking
+        case .reconnecting: return .reconnecting
+        case .connected:    return .connected
+        case .error:        return .error
+        }
+    }
+
+    /// SSID shown in the status banner. In demo mode there is no real
+    /// network, so surface a clearly-synthetic placeholder instead of the
+    /// last real SSID. When nothing is configured yet (no bike, no demo),
+    /// return nil so the banner shows no SSID chip at all.
+    var bikeSsid: String? {
+        if bikeLink.demoMode { return "RE_DEMO_000001" }
+        let s = bikeLink.ssid
+        return s.isEmpty ? nil : s
+    }
+    var lastError: String? { bikeLink.lastError ?? metrics.lastError }
+
+    /// Connect to a specific saved bike: make it the active bike, ensure the
+    /// phone is on that bike's Wi-Fi (joining it if needed — the AP has no
+    /// internet, so we must be associated before the dash handshake), then
+    /// start the K1G connect flow. Demo mode skips the Wi-Fi step entirely
+    /// (there's no real AP to join).
+    func connect(to bike: SavedBike) {
+        savedBikes.select(id: bike.id)
+        bikeLink.ssid = bike.ssid
+
+        // A newer connect supersedes a join still in flight.
+        joinTask?.cancel(); joinTask = nil
+
+        if bikeLink.demoMode {
+            bikeLink.connect()
+            return
+        }
+
+        // Manual-Wi-Fi test build: iOS Settings must be used to join the
+        // bike's access point. Do not call NEHotspotConfigurationManager,
+        // which requires the Hotspot Configuration entitlement unavailable
+        // to many free Personal Team signing setups.
+        bikeLink.connect()
+    }
+
+    /// The Wi-Fi join started by `connect(to:)`, so a newer connect can
+    /// cancel a stale one.
+    @ObservationIgnored private var joinTask: Task<Void, Never>?
+
+    /// Add a bike to the garage AND register its Wi-Fi network with iOS, so
+    /// the phone knows the AP (fixed WPA2 passphrase) and can auto-join it on
+    /// later rides. SSID + name come from the add-bike form.
+    func addBike(name: String, ssid: String) {
+        guard let bike = savedBikes.add(name: name, ssid: ssid) else { return }
+        // Manual-Wi-Fi test build: do not register/join the AP from the app.
+    }
+
+    /// Remove a bike from the garage AND drop its Wi-Fi configuration from
+    /// iOS, so we don't leave orphan networks behind.
+    func removeBike(id: UUID) {
+        guard let bike = savedBikes.bikes.first(where: { $0.id == id }) else { return }
+        let ssid = bike.ssid
+        savedBikes.remove(id: id)
+        // Manual-Wi-Fi test build: no system Wi-Fi configuration to remove.
+    }
+
+    // MARK: - Streaming
+
+    var metrics: StreamMetrics = .zero
+    private(set) var streamer: RtpStreamer?
+    /// True while a demo-mode projection is running (no RtpStreamer exists —
+    /// frames are mirrored to `demoDashModel` instead of encoded to UDP).
+    private(set) var isDemoStreaming: Bool = false
+    var isStreaming: Bool { streamer?.state == .running || isDemoStreaming }
+
+    // MARK: - Background keep-alive (Phase 6)
+
+    /// User-controlled: when true, we hold a CoreLocation background
+    /// wakelock while streaming so the iPhone screen can
+    /// lock without iOS suspending the app (which kills the
+    /// VTCompressionSession with `kVTInvalidSessionErr` / -12903).
+    /// Defaults to ON — the whole point of Phase 6 is that this is the
+    /// supported default mode of operation.
+    var keepAwakeWhileStreaming: Bool = true {
+        didSet { applyKeepAwake() }
+    }
+
+    /// True while the rider has an ACTIVE projection session — navigating a
+    /// route or free-riding — regardless of whether RTP frames are flowing
+    /// at this instant.
+    ///
+    /// This is the "intent to stream", as opposed to `isStreaming`, which is
+    /// the "currently streaming" fact (`streamer?.state == .running`). The
+    /// two diverge exactly during a reconnect, and that gap is what this
+    /// property exists to cover — see `applyKeepAwake` for the deadlock it
+    /// fixes.
+    var hasStreamingIntent: Bool {
+        isFreeRiding
+            || (activeNavigator.isNavigating && !activeNavigator.hasArrived)
+    }
+
+    /// Reflects whether the location wakelock is active right now. Used
+    /// by the UI to show a "Background mode active" badge. Background
+    /// survival is owned entirely by CoreLocation background updates.
+    var backgroundKeepAliveActive: Bool {
+        wakelockToken != nil
+    }
+
+    /// Shared CLLocationManager: serves the wakelock, the Phase 5 map
+    /// source, and (Phase 7+) the nav engine. Single owner avoids racing
+    /// two managers for the same authorization + indicator pill.
+    let locationService = LocationService()
+
+    /// GPS trip computer — folds the shared location fix stream into live
+    /// ride totals (distance / moving time / avg+max speed / ascent). Same
+    /// fix stream as the map/nav/telemetry; no second manager. Phone-side
+    /// only — not wired to any K1G dash TLV.
+    let rideStats: RideStatsService
+
+    /// Every ride of the last 30 days (feat/ride-history), fed by
+    /// `rideStats` at each teardown. Backs the picker's Ride history sheet.
+    let rideHistory = RideHistoryStore()
+
+    /// The rider's garage — saved bikes (by Wi-Fi SSID), add/remove/select.
+    /// Drives which SSID the connect flow targets; the dash IP is a global
+    /// constant (192.168.1.1), never per-bike. Owned here as the single
+    /// source of truth for both the settings list and the home-screen picker.
+    let savedBikes = SavedBikesStore()
+
+    private var wakelockToken: UUID?
+
+    /// Spoken turn-by-turn guidance. Owns the shared `AVAudioSession`,
+    /// holding it in `.playback` + `.mixWithOthers` and keeping it active
+    /// for the ride so prompts play over the lock screen. Held for the
+    /// app's lifetime; only actually speaks while `dashNavSettings.voiceEnabled`.
+    let voiceNavigator = VoiceNavigator()
+
+    /// Demo-mode presentation model — the on-screen stand-in for the physical
+    /// Tripper dash. Populated only while `bikeLink.isDemo` is streaming: the
+    /// mapViewSource frame callback mirrors the composited video into
+    /// `latestFrame`, and `ActiveNavLoop` pushes the native-bubble snapshot.
+    /// Held for the app's lifetime (cheap, empty when not in demo); the
+    /// `DashPreviewPanel` binds to it.
+    let demoDashModel = DemoDashModel()
+
+    /// Reused Core Image context for converting demo-mirror CVPixelBuffers
+    /// (BGRA) into CGImages. Creating a CIContext is expensive, so we cache a
+    /// single instance and reuse it for every 4 Hz frame. `@ObservationIgnored`
+    /// — it's plumbing, never observed by the UI.
+    @ObservationIgnored private lazy var demoCIContext = CIContext(options: nil)
+
+    init() {
+        // The trip computer shares the one LocationService (already
+        // initialised as an inline stored property). Assigned here rather
+        // than inline because a stored-property default can't reference
+        // another property (`self` isn't available yet at that point).
+        rideStats = RideStatsService(location: locationService, history: rideHistory)
+
+        // Wire BikeLink → DashNavSettings so the wire-encoding helpers
+        // (units, decimal separator, clock format, bottom-line mutex)
+        // are reachable from inside the connection flow. Both objects
+        // exist as inline stored properties, so this is the first
+        // moment we can connect them.
+        bikeLink.settings = dashNavSettings
+
+        // Point the link at the active bike (if any) so the banner + connect
+        // flow agree from the start.
+        if let active = savedBikes.selected {
+            bikeLink.ssid = active.ssid
+        }
+
+        // NOTE: `BikeLink` deliberately has NO way to re-join the AP. The
+        // reconnect loop waits for iOS auto-join instead of forcing an
+        // association, because forcing one can raise a system join dialog and
+        // the rider is typically riding off with the phone in their pocket —
+        // see the long note in `BikeLink.runConnectFlow`. `WiFiJoiner` is used
+        // only from `connect(to:)` (an explicit, foreground user action)
+        // and `addBike()` (which persists the network with joinOnce = false so
+        // iOS can auto-join it forever after).
+
+        // Watch `bikeLink.state` so the wakelock follows the link, not
+        // just the streamer. When the bike disconnects mid-ride, we
+        // tear the keepers (and the now-pointless streamer) down within
+        // one observation tick — no point burning battery and shoving
+        // UDP into a black hole.
+        observeBikeLink()
+        wireNavigation()
+        wireCallObserver()
+        wireDeviceTelemetry()
+        wireRideAlerts()
+        wireDashButtons()
+    }
+
+    /// Re-registers itself on every state change — that's the standard
+    /// iOS 17 `withObservationTracking` idiom for "watch this property
+    /// continuously", since the closure fires exactly once per trigger.
+    private func observeBikeLink() {
+        withObservationTracking {
+            _ = bikeLink.state
+        } onChange: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                let state = self.bikeLink.state
+                // Re-arm BEFORE any await below: a resume awaits
+                // `startStreaming()` for ~2 s, and a drop inside that window
+                // must still be seen (and torn down). Re-entrancy is safe —
+                // `startStreaming` re-checks the link and its streamer right
+                // before `s.start()`, so a stale resume bails.
+                self.observeBikeLink()
+                // Session teardown detector: the link reached a terminal
+                // down-state. `.idle` = user disconnect; `.error` =
+                // auto-reconnect gave up after its reconnect budget (motorcycle
+                // switched off). Both end the ride session.
+                let sessionEnded: Bool
+                switch state {
+                case .idle, .error: sessionEnded = true
+                case .connecting, .handshaking, .reconnecting, .connected: sessionEnded = false
+                }
+                if sessionEnded && self.rideStats.stats.startedAt != nil {
+                    // Zero the trip computer so the next connected ride starts
+                    // fresh and the post-arrival panel stops showing stale
+                    // totals. (`reset()` also clears the last-ride copy
+                    // persisted to UserDefaults.) Frozen totals from a plain arrival are kept: this
+                    // fires only on a real teardown, not on stopStreaming() at
+                    // a waypoint.
+                    self.rideStats.reset()
+                }
+                if self.isStreaming && state != .connected {
+                    // Link left .connected (dropped → reconnecting) while
+                    // streaming — kill the RTP pipeline; RtpStreamer doesn't
+                    // watch the link itself and would keep encoding into the
+                    // void. The stream re-arms below once we're back.
+                    self.stopStreaming()
+                } else if state != .connected, self.streamer != nil {
+                    // SAME cleanup, for the case `isStreaming` already went
+                    // false on its own. THIS is the reconnect-hang bug
+                    // (field log, 8/2026, free-ride):
+                    //
+                    //   19:09:26.132  RtpStreamer failed: NWError 57
+                    //                 (Socket is not connected)
+                    //                 → fail() → stop() → state = .idle
+                    //   19:09:26.227  Link dropped (wifi-path-down)   [+95 ms]
+                    //
+                    // The trigger is the ordinary, expected one: the rider
+                    // switching the motorcycle off and on again (the AP goes
+                    // away with it). Not an exotic radio failure — this is
+                    // the normal petrol-stop / restart case the whole
+                    // auto-reconnect path exists to survive, and it is
+                    // trivially reproducible on demand.
+                    //
+                    // `isStreaming` is derived purely from
+                    // `streamer?.state == .running`, so the streamer's own
+                    // failure had ALREADY flipped it false 95 ms before the
+                    // link-drop observation arrived. The branch above
+                    // therefore did not fire, `stopStreaming()` never ran,
+                    // and `streamer` was left non-nil holding a dead
+                    // RtpStreamer. Both resume paths guard on
+                    // `streamer == nil`, so on reconnect:
+                    //
+                    //   19:09:41.218  Free-ride resume skipped —
+                    //                 state=connected streamer=present
+                    //
+                    // …no RTP was ever started and the dash sat on Timeout.
+                    // The dead streamer would have blocked EVERY subsequent
+                    // start for the rest of the app session, not just this
+                    // reconnect.
+                    //
+                    // Ordering note: this is deliberately a second branch
+                    // rather than a relaxed condition on the first, so the
+                    // healthy case (still .running when the link drops)
+                    // keeps its existing behaviour untouched.
+                    self.stopStreaming()
+                } else if state == .connected
+                            && self.activeNavigator.isNavigating
+                            && !self.activeNavigator.hasArrived
+                            && !self.isStreaming {
+                    // Reconnected mid-ride → bring the dash projection back
+                    // automatically so navigation reappears without the
+                    // rider touching the phone (e.g. walked back from the
+                    // petrol-station till). The tile cache survived the drop
+                    // (never released on stop), so there's no re-bake.
+                    //
+                    // The `!hasArrived` guard is load-bearing: on final
+                    // arrival `ActiveNavigator` leaves
+                    // `isNavigating == true` for the HUD's ~4 s dismiss beat.
+                    // Without this guard, a link flap inside that window would
+                    // re-arm navigation for a route that is already finished;
+                    // `finishArrival()` is about to clear it and switch to
+                    // free ride. `hasArrived` resets on the next
+                    // start()/stop(), so legitimate reconnects still fire.
+                    //
+                    // Field report (8/2026): this branch fires (dash shows
+                    // "iPhone connected"), but the dash then sits on
+                    // "Timeout" and the phone UI stays on "Connected — idle"
+                    // for tens of seconds — i.e. `startStreaming()` never
+                    // reaches `.running`. (The diagnostic logging once added
+                    // around this path to chase it has since been removed.)
+                    await self.startStreaming()
+                } else if state == .connected
+                            && self.isFreeRiding
+                            && !self.isStreaming {
+                    // Reconnected mid-free-ride → resume projection
+                    // automatically, mirroring the navigation-resume branch
+                    // above. `isFreeRiding` is the rider's persistent INTENT
+                    // (set by startFreeRide(), cleared only by an explicit
+                    // stopFreeRide() — never by the involuntary stopStreaming()
+                    // a drop triggers), so it correctly survives the drop.
+                    // Without this branch the phone's UI kept showing
+                    // "free-riding" (isFreeRiding still true) while no RTP
+                    // stream was actually running — the dash timed out
+                    // waiting for frames that never came (rider feedback
+                    // 8/2026: reconnect after the bike was switched off).
+                    await self.resumeFreeRideAfterReconnect()
+                } else {
+                    // A reconnect where NEITHER resume branch fired starts no
+                    // RTP, so the dash sits on its loading dots until it times out.
+                    self.applyKeepAwake()
+                }
+            }
+        }
+    }
+
+    /// Strong reference to the dash frame source (tile cache + CGContext
+    /// renderer). Created lazily
+    /// on first access. Lives for the duration of the app session so
+    /// the FG-baked tile cache persists across start/stop streaming
+    /// cycles.
+    @ObservationIgnored private var _mapViewSource: MapViewSource?
+    var mapViewSource: MapViewSource {
+        if let s = _mapViewSource { return s }
+        let s = MapViewSource(locationService: locationService,
+                              activeNavigator: activeNavigator)
+        _mapViewSource = s
+        return s
+    }
+    /// Spin up the RTP pipeline pointed at the currently-connected dash.
+    /// No-op if the link isn't connected yet.
+    ///
+    /// `async` (not fire-and-forget) so callers that need the dash to have
+    /// actually entered nav projection before doing anything else (there
+    /// currently are none downstream of the await point, but the ordering
+    /// guarantee inside this function — nav-start MUST land before the
+    /// first RTP packets, see the comment at the `await
+    /// bikeLink.sendNavStart()` call below — needs `startStreaming` itself
+    /// to be awaitable for that to be real rather than cosmetic).
+    func startStreaming() async {
+        guard bikeLink.dashHost != nil else { return }
+
+        // ── Demo mode: fake dash, no UDP ────────────────────────────────
+        // In demo mode there is no RtpStreamer and no encoder — instead we
+        // start the SAME MapViewSource frame pump and mirror each composited
+        // 526×300 buffer onto `demoDashModel.latestFrame` for the on-screen
+        // dash preview. The ActiveNavLoop still runs (its K1G TLV sends are
+        // no-ops via BikeLink's demo guards) and pushes the native-bubble
+        // snapshot into `demoDashModel.bubble`. Everything else (GPS, MapKit
+        // routing, tile bake, voice) is fully real.
+        if bikeLink.isDemo {
+            guard !isDemoStreaming else { return }
+            isDemoStreaming = true
+
+            let ctx = demoCIContext
+            let model = demoDashModel
+            mapViewSource.start { pixelBuffer, _ in
+                // Fires from MapViewSource's main-actor render tick. Convert
+                // the BGRA CVPixelBuffer to a CGImage here, then publish via
+                // a main-actor Task for SwiftUI.
+                let ci = CIImage(cvPixelBuffer: pixelBuffer)
+                let w = CVPixelBufferGetWidth(pixelBuffer)
+                let h = CVPixelBufferGetHeight(pixelBuffer)
+                guard let cg = ctx.createCGImage(ci, from: CGRect(x: 0, y: 0, width: w, height: h)) else { return }
+                Task { @MainActor in model.latestFrame = cg }
+            }
+
+            let liveAct = LiveActivityController()
+            liveAct.start(destinationName: activeNavigator.rideTitle)
+            self.liveActivity = liveAct
+
+            let loop = ActiveNavLoop(
+                bikeLink: bikeLink,
+                navigator: activeNavigator,
+                mapSource: mapViewSource,
+                settings: dashNavSettings,
+                location: locationService,
+                voice: voiceNavigator,
+                demo: demoDashModel,
+                liveActivity: liveAct
+            )
+            voiceNavigator.enabled = dashNavSettings.voiceEnabled
+            loop.start()
+            activeNavLoop = loop
+            rideStats.begin()
+            applyKeepAwake()
+            return
+        }
+
+        // A streamer that exists but is NOT running is dead weight — it can
+        // never produce frames again (RtpStreamer.start() only accepts
+        // .idle/.failed, and this instance's encoder + UDP connection are
+        // already torn down by fail()/stop()). Holding onto it makes the
+        // guard below reject every future start for the rest of the app
+        // session. Clear it and carry on rather than returning.
+        //
+        // Field log 8/2026: `RtpStreamer failed: NWError 57 (Socket is not
+        // connected)` left exactly this state behind, and the next
+        // reconnect logged "Free-ride resume skipped — streamer=present"
+        // and never started RTP → dash Timeout. The observer in
+        // `observeBikeLink` now also clears it on a link drop, but this
+        // covers the case where the streamer dies while the link stays
+        // .connected, where no state-change observation fires at all.
+        if let existing = streamer, existing.state != .running, existing.state != .starting {
+            existing.stop()
+            streamer = nil
+        }
+
+        guard streamer == nil, let host = bikeLink.dashHost else {
+            // Silent no-op: if `streamer` is non-nil (still running or
+            // starting) or `dashHost` came back nil (link state raced this
+            // call), `startStreaming` returns having done NOTHING — no route
+            // card, no nav-start, no RTP — with zero trace anywhere. That is
+            // indistinguishable in the field from every step below actually
+            // running and silently stalling.
+            return
+        }
+
+        let source = mapViewSource   // shared instance, lazily created
+        let s = RtpStreamer(bikeHost: host, source: source)
+        s.bikeLink = bikeLink
+        s.onMetrics = { [weak self] m in
+            guard let self else { return }
+            self.metrics = StreamMetrics(
+                encodedFps: m.encodedFps,
+                kbpsOut: m.kbpsOut,
+                packetsSent: m.packetsSent,
+                packetsDropped: m.packetsDropped,
+                nalsEmitted: m.nalsEmitted,
+                idrCount: m.idrCount,
+                lastError: m.lastError
+            )
+        }
+        streamer = s
+        // Route card FIRST, then nav-start, then the RTP stream — the dash
+        // gates its UDP/5000 decoder surface on ALL THREE happening in
+        // that order (see `BikeLink.sendRouteCard`'s doc / the
+        // `royal-enfield-tripper-dash` skill's network-transport
+        // reference). Field report (8/2026): free-ride reconnects kept
+        // landing on the dash's "Press the cast button on RE App!" idle
+        // screen even after the nav-start-ordering and post-z2-warmup
+        // fixes below, because THIS packet was never sent for free-ride at
+        // all — `ActiveNavLoop.tick()` only sends anything route-shaped
+        // (`sendActiveNav`) while `nav.isNavigating`, so free-ride (by
+        // design, no route) announced no destination whatsoever. Use the
+        // ride's final stop (`ActiveNavigator.rideTitle`) when navigating;
+        // fall back to a generic "Free ride" title, as the reference
+        // implementation falls back to its own default ("Navigation").
+        await bikeLink.sendRouteCard(
+            title: activeNavigator.rideTitle ?? "Free ride",
+            includeManeuverPlaceholders: !isFreeRiding
+        )
+        // Superseded (Stop, or a newer start) while the card was going out:
+        // don't interleave nav-start into the newer session. Nav-start hasn't
+        // gone out yet and `stopStreaming()` already sent its nav-stop.
+        guard streamer === s else { return }
+        // Kick the dash into nav projection BEFORE starting the RTP
+        // stream — without START_NAV + NAV_CTX the dash never switches off
+        // the home widgets and treats UDP/5000 as noise.
+        //
+        // MUST be awaited here, not fire-and-forget. It used to be
+        // `Task { await link.sendNavStart() }` immediately followed by
+        // `s.start()` — spawning the send and starting the RTP stream
+        // ran CONCURRENTLY, not in the sequence the comment above
+        // describes, so there was no actual ordering guarantee that
+        // nav-start reached the dash before the first video packets did.
+        // Under normal conditions the K1G send (~1ms) easily wins that
+        // race against RTP spin-up, so this went unnoticed for months.
+        // Field report (8/2026): right after a reconnect that needed
+        // several boot-race retries (dash's K1G control-plane task
+        // visibly still catching up — see the reconnect fast-retry fix
+        // two commits ago), the dash showed a plain Wi-Fi "share" screen
+        // instead of entering nav projection, exactly the failure mode
+        // this comment warns about. A dash still finishing its own
+        // internal recovery is far more likely to be slow to process
+        // START_NAV/NAV_CTX, which is exactly when this unenforced ordering
+        // actually matters. Awaiting a UDP send is cheap (single-digit
+        // ms in practice) — no perceptible startup delay for the normal
+        // case, and a real ordering guarantee for the racy one.
+        await bikeLink.sendNavStart()
+        // Post-z2 confirmation route card — ONE more 0x007E immediately
+        // after nav-start, mirroring the reference (`_enter_nav_mode`:
+        // "Post-z2 confirmation route card", and
+        // `tripper_app_like_nav.py` step 4: "one more 0x007E right after
+        // z2, mirroring the phone (frame 1475, 22ms after z2). Acts as a
+        // 'destination still valid' confirmation while the dash allocates
+        // the decoder surface."). Distinct from both the pre-z2 burst
+        // above and the 1Hz keep-alive in ActiveNavLoop: this one lands
+        // inside the window where the dash is actually setting the surface
+        // up, which is exactly when its "is there still a destination?"
+        // check runs.
+        await bikeLink.sendRouteCardKeepalive(title: activeNavigator.rideTitle ?? "Free ride")
+        // Post-z2 warm-up (see K1G.postZ2Warmup's doc for the pcap-derived
+        // 450ms and why the ordering fix above wasn't sufficient on its
+        // own): give the dash's firmware time to actually allocate its
+        // nav-decoder surface before the first RTP/H.264 packets arrive,
+        // not just time for our UDP send() to return. Field report
+        // (8/2026): even with nav-start correctly ordered before
+        // s.start(), the dash still bounced back to its "Press the cast
+        // button on RE App!" idle screen on some reconnects — the decoder
+        // surface plainly wasn't ready yet when the video hit the wire.
+        try? await Task.sleep(nanoseconds: UInt64(K1G.postZ2Warmup * 1_000_000_000))
+        // The awaits above take ~2 s. In that window the link can drop, the
+        // rider can tap Stop, or an overlapping resume can install its own
+        // streamer. Starting anyway would stream into a dead link or leave an
+        // orphan nothing can stop, so bail before `s.start()` and before the
+        // nav loop / Live Activity / ride stats below. `isFreeRiding` is left
+        // as-is, like a mid-ride drop: a reconnect resumes the ride.
+        // `hasStreamingIntent` catches a nav Stop: `stopNavigation` skips
+        // `stopStreaming()` while the new streamer isn't running yet.
+        let link = bikeLink
+        guard streamer === s, link.state == .connected, hasStreamingIntent else {
+            if streamer === s { streamer = nil }
+            // Nav-start already went out, so leave projection unless a newer
+            // start owns the session. Also after a Stop in the window: its
+            // nav-stop went out BEFORE our nav-start. Re-checked when the send
+            // runs, and a no-op if the link is down.
+            Task { if self.streamer == nil { await link.sendNavStop() } }
+            applyKeepAwake()
+            return
+        }
+        s.start()
+        // Latch the "projection on" flag shortly after start so the
+        // dash has the PROJ_ON hint while the first frames are landing.
+        // 250 ms gives the encoder time to emit its first NAL and the
+        // RTP UDP connection to reach .ready.
+        Task {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            await link.sendProjectionOn()
+        }
+
+        // Regular 1 Hz active-nav pump — feeds maneuver glyph + distance
+        // + road name overlay onto the streamed map frames and sends
+        // the K1G active-nav TLV bursts to the dash bubble.
+        let liveAct = LiveActivityController()
+        liveAct.start(destinationName: activeNavigator.rideTitle)
+        self.liveActivity = liveAct
+
+        let loop = ActiveNavLoop(
+            bikeLink: bikeLink,
+            navigator: activeNavigator,
+            mapSource: mapViewSource,
+            settings: dashNavSettings,
+            location: locationService,
+            voice: voiceNavigator,
+            liveActivity: liveAct
+        )
+        // Keep the synth's cheap enable gate in sync with the setting so a
+        // stale prompt can't slip out between ticks after the rider toggles
+        // voice off. The loop also re-checks the flag each tick.
+        voiceNavigator.enabled = dashNavSettings.voiceEnabled
+        loop.start()
+        activeNavLoop = loop
+        rideStats.begin()   // start folding GPS fixes into the trip computer
+        applyKeepAwake()
+    }
+
+    func stopStreaming() {
+        // ── Demo mode teardown ──────────────────────────────────────────
+        if isDemoStreaming {
+            isDemoStreaming = false
+            activeNavLoop?.stop()
+            activeNavLoop = nil
+            liveActivity?.end()
+            liveActivity = nil
+            voiceNavigator.stop()
+            mapViewSource.stop()
+            demoDashModel.clear()
+            rideStats.end()
+            metrics = .zero
+            applyKeepAwake()
+            return
+        }
+
+        // Tell the dash to leave nav projection BEFORE we yank the
+        // encoder — it expects (h, x) before the frames stop, otherwise
+        // it sometimes wedges on the last bitmap until the next reboot.
+        let link = bikeLink
+        activeNavLoop?.stop()
+        activeNavLoop = nil
+        liveActivity?.end()
+        liveActivity = nil
+        // Silence spoken guidance on teardown. On a MANUAL stop this cuts any
+        // prompt mid-sentence (rider ended the ride — no reason to keep
+        // talking). ARRIVAL no longer comes through here — the stream stays
+        // up and onArrived speaks its confirmation, so the line is not cut.
+        voiceNavigator.stop()
+        Task { await link.sendNavStop() }
+        streamer?.stop()
+        streamer = nil
+        rideStats.end()   // drop the fix subscription; totals stay on screen
+        // mapViewSource is intentionally NOT released — its tile cache
+        // should survive stop/start cycles so the next ride doesn't have
+        // to re-bake.
+        metrics = .zero
+        applyKeepAwake()
+    }
+
+    // MARK: - Free ride (map projection without a planned route)
+
+    /// True while a free-ride session is projecting the map to the dash
+    /// with NO planned route and NO active navigation — just a live,
+    /// heading-up map baked around the rider's GPS position. Drives the
+    /// picker's display mode (the live MKMapView must be unmounted while
+    /// we stream, same GPU-pool rule as navigation) and the control
+    /// button's "Stop free ride" state.
+    private(set) var isFreeRiding: Bool = false
+
+    /// Start projecting the map to the dash WITHOUT a route. Mirrors the
+    /// route-start path (`startStreaming` + the nav-mode kick + the 1 Hz
+    /// ActiveNavLoop heartbeat), but installs an EMPTY `RouteTileCache`
+    /// instead of a baked corridor.
+    ///
+    /// The empty cache is the whole trick: the BG renderer's
+    /// `drawTileCacheFrame` calls `nearestTile`, which misses on an empty
+    /// tile list, so every frame falls through to the position-fallback
+    /// path — which bakes a live OSM tile around the rider's raw GPS and
+    /// keeps it fresh as they move (`ensurePositionFallback` +
+    /// `positionFallbackValidRadius`). That path already exists for the
+    /// off-corridor rescue case during navigation; free-ride just makes it
+    /// the ONLY source, so we get a real heading-up map with zero route
+    /// geometry.
+    ///
+    /// `ActiveNavLoop` already handles the "streaming but not navigating"
+    /// case: with `activeNavigator.isNavigating == false` it sends a
+    /// no-maneuver heartbeat every second so the dash keeps its projection
+    /// latch open without drawing a bogus turn arrow.
+    ///
+    /// No-op if not connected, already streaming, or already free-riding.
+    func startFreeRide() async {
+        // Same "dead streamer isn't a live stream" reasoning as
+        // `resumeFreeRideAfterReconnect` — a corpse left in .idle/.failed
+        // must not block the rider's manual "Start free ride" tap either.
+        // `startStreaming()` discards it.
+        let alive = streamer.map { $0.state == .running || $0.state == .starting } ?? false
+        guard bikeLink.state == .connected, !alive, !isFreeRiding else { return }
+        isFreeRiding = true
+        installFreeRideContent()
+        await startStreaming()
+    }
+
+    /// Resume a free-ride projection after the link drops and reconnects.
+    /// Deliberately does NOT go through `startFreeRide()`: that guards on
+    /// `!isFreeRiding`, but `isFreeRiding` is the rider's persistent INTENT
+    /// and is still `true` here (a drop never clears it) — routing through
+    /// `startFreeRide()` would be a silent no-op. `isFreeRiding` is already
+    /// `true`, so only reinstall the content (fresh empty tile cache + camera
+    /// prefetch — cheap, no re-bake needed) and restart the stream.
+    private func resumeFreeRideAfterReconnect() async {
+        // Only a RUNNING (or starting) streamer means "already projecting"
+        // and should suppress the resume. A streamer left behind in
+        // .idle/.failed/.stopping is dead weight — `startStreaming()` now
+        // discards it — and must NOT block the resume.
+        //
+        // Field log 8/2026, the exact line this fixes:
+        //   19:09:41.218 Free-ride resume skipped — state=connected
+        //                streamer=present
+        // The "present" streamer there was a corpse: it had failed 15 s
+        // earlier with NWError 57 and was sitting in .idle. The old
+        // `streamer == nil` guard could not tell that apart from a healthy
+        // live stream, so it skipped the resume, no RTP was ever sent, and
+        // the dash timed out.
+        let alive = streamer.map { $0.state == .running || $0.state == .starting } ?? false
+        guard bikeLink.state == .connected, !alive else {
+            return
+        }
+        installFreeRideContent()
+        await startStreaming()
+    }
+
+    /// Swap the streamed content from active-navigation to free-ride WITHOUT
+    /// tearing the RTP stream down. Used on arrival: the dash stays in
+    /// projection the whole time (no `sendNavStop`/`sendProjectionOff`, no
+    /// encoder restart), so the display never blinks between "arrived" and the
+    /// live free-ride map. The already-running `ActiveNavLoop` drops into its
+    /// no-maneuver heartbeat automatically once `activeNavigator.isNavigating`
+    /// goes false (via `stop()` in `finishArrival`). No-op if the stream isn't
+    /// up or we're already free-riding.
+    func transitionToFreeRideInPlace() {
+        guard isStreaming, !isFreeRiding else { return }
+        isFreeRiding = true
+        installFreeRideContent()
+        applyKeepAwake()
+    }
+
+    /// Shared free-ride content setup: empty tile cache (position-fallback
+    /// bake), cleared route geometry, camera prefetch. Does NOT touch the
+    /// stream — callers decide whether to start one (`startFreeRide`) or reuse
+    /// the running one (`transitionToFreeRideInPlace`).
+    private func installFreeRideContent() {
+        // Resolve Light/Dark/Auto for the current position+time before the
+        // first bake, so free-ride opens in the right palette (same as the
+        // navigation start path).
+        primeMapStyleForStart()
+
+        // Install an EMPTY tile cache in the renderer's current style. With
+        // no baked corridor, the render path routes every frame through the
+        // position-fallback bake around the rider's GPS. Clear any stale
+        // route polyline so no old route line ghosts onto the free-ride map.
+        let emptyCache = RouteTileCache(style: mapViewSource.currentStyle)
+        mapViewSource.setRoutePolyline(nil)
+        mapViewSource.setFullRoute(coords: [], waypoints: [])
+        mapViewSource.setAlternativeRoutes([])
+        mapViewSource.setTraveled([])
+        mapViewSource.setRouteAhead([])
+        mapViewSource.setCurrentRoute(nil)
+        mapViewSource.setTileCache(emptyCache)
+
+        // Free-ride has no route corridor to prefetch along, so cameras and
+        // speed limits are fetched AROUND the rider instead, and again each
+        // time they've moved `freeRideAlertRefetchMeters` from the last
+        // centre. The fix subscription replays the last fix at once, so this
+        // also covers "no GPS fix yet at free-ride start". A nav-route limit
+        // fetch still in flight must not land on the free-ride map; the
+        // route's limits stay until the first free-ride set replaces them.
+        speedLimitPrefetchTask?.cancel()
+        freeRideAlertCenter = nil
+        freeRideLimitsFailed = false
+        freeRideLimitRetryDelay = Self.freeRideAlertRetrySeconds
+        freeRideFixSubscription = locationService.subscribeFixes { [weak self] fix in
+            Task { @MainActor in self?.refreshFreeRideAlerts(near: fix.coordinate) }
+        }
+    }
+
+    /// Half-side (m) of the square fetched around the rider in free-ride.
+    static let freeRideAlertRadiusMeters: Double = 6_000
+    /// Refetch once the rider is this far from the last centre, i.e. still
+    /// 3 km inside the loaded square.
+    static let freeRideAlertRefetchMeters: Double = 3_000
+    /// First retry of a FAILED limit fetch (Overpass busy / timed out),
+    /// doubled after each further failure up to `freeRideAlertRetryMaxSeconds`.
+    static let freeRideAlertRetrySeconds: TimeInterval = 60
+    static let freeRideAlertRetryMaxSeconds: TimeInterval = 600
+    @ObservationIgnored private var freeRideFixSubscription: LocationSubscription?
+    @ObservationIgnored private var freeRideAlertCenter: CLLocationCoordinate2D?
+    @ObservationIgnored private var freeRideAlertAt = Date.distantPast
+    @ObservationIgnored private var freeRideLimitsFailed = false
+    @ObservationIgnored private var freeRideLimitRetryDelay = AppStatus.freeRideAlertRetrySeconds
+
+    /// Per-fix free-ride hook: fetch cameras + limits around the rider on
+    /// the first fix and after `freeRideAlertRefetchMeters` of travel; in
+    /// between, retry ONLY a failed limit fetch (not an untagged region),
+    /// for the same box, with backoff.
+    private func refreshFreeRideAlerts(near coord: CLLocationCoordinate2D) {
+        guard isFreeRiding, !activeNavigator.isNavigating else { return }
+        // Link gave up (`.error`) but free ride is still on: no dash to show
+        // anything on, so don't keep querying Overpass.
+        guard bikeLink.state == .connected || bikeLink.state == .reconnecting else { return }
+        let now = Date()
+        if let center = freeRideAlertCenter {
+            let moved = CLLocation(latitude: center.latitude, longitude: center.longitude)
+                .distance(from: CLLocation(latitude: coord.latitude, longitude: coord.longitude))
+            if moved < Self.freeRideAlertRefetchMeters {
+                if freeRideLimitsFailed, dashNavSettings.speedLimitDisplay != .off,
+                   now.timeIntervalSince(freeRideAlertAt) >= freeRideLimitRetryDelay {
+                    freeRideAlertAt = now
+                    freeRideLimitRetryDelay = min(freeRideLimitRetryDelay * 2,
+                                                  Self.freeRideAlertRetryMaxSeconds)
+                    prefetchFreeRideSpeedLimits(around: center)
+                }
+                return
+            }
+        }
+        // Snap the centre to the 0.01° grid the cache keys use, so riding
+        // the same area again hits the disk cache instead of a fresh box
+        // every time. Shifts it ≲ 0.8 km; `moved` is measured from the
+        // snapped centre, so the rider still refetches 3 km inside the edge.
+        let center = CLLocationCoordinate2D(latitude: (coord.latitude * 100).rounded() / 100,
+                                            longitude: (coord.longitude * 100).rounded() / 100)
+        freeRideAlertCenter = center
+        freeRideAlertAt = now
+        prefetchFreeRideCameras(around: center)
+        prefetchFreeRideSpeedLimits(around: center)
+    }
+
+    /// Fetch the speed-limit layer around `center` for free-ride. Shares
+    /// `speedLimitPrefetchTask`, so a nav start cancels it. A failed fetch
+    /// (no roads) keeps whatever is loaded and arms the retry above; an
+    /// untagged region (roads, no limits) is a success and is installed.
+    private func prefetchFreeRideSpeedLimits(around center: CLLocationCoordinate2D) {
+        speedLimitPrefetchTask?.cancel()
+        pushSpeedLimitConfig()
+        guard dashNavSettings.speedLimitDisplay != .off else {
+            mapViewSource.setSpeedLimits(.empty)
+            return
+        }
+        speedLimitPrefetchTask = Task { @MainActor [weak self] in
+            let data = await SpeedLimitService.shared.limitsAround(
+                center: center, radiusMeters: Self.freeRideAlertRadiusMeters)
+            guard let self, !Task.isCancelled,
+                  self.isFreeRiding, !self.activeNavigator.isNavigating,
+                  self.dashNavSettings.speedLimitDisplay != .off else { return }
+            self.freeRideLimitsFailed = data.roads.isEmpty
+            // Time the backoff from the failure, not the start: a fetch can
+            // take ~80 s to fail across both mirrors.
+            guard !data.roads.isEmpty else { self.freeRideAlertAt = Date(); return }
+            self.freeRideLimitRetryDelay = Self.freeRideAlertRetrySeconds
+            self.mapViewSource.setSpeedLimits(data)
+        }
+    }
+
+    /// Fetch speed cameras around `center` and hand them to the renderer
+    /// ONLY (map overlay, no voice) for free-ride. No-op when the camera
+    /// toggle is off (and clears any stale markers). 6 km half-side square
+    /// around the fix — a generous neighbourhood without a huge Overpass
+    /// query. MAP ONLY — never handed to `activeNavLoop`, so no voice fires
+    /// (free-ride has no turn-by-turn).
+    private func prefetchFreeRideCameras(around center: CLLocationCoordinate2D) {
+        speedCameraPrefetchTask?.cancel()
+        // Retire the finished route's camera/section set: a reroute fetch
+        // still in flight (those aren't cancellable) must not land on the
+        // free-ride map, and a later nav loop must not be seeded with it.
+        speedCameraGeneration += 1
+        speedCameraData = .empty
+        speedCameraCoverage = []
+        guard dashNavSettings.speedCamerasEnabled else {
+            mapViewSource.setSpeedCameras([])
+            return
+        }
+        speedCameraPrefetchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let cams = await SpeedCameraService.shared.camerasAround(
+                center: center, radiusMeters: Self.freeRideAlertRadiusMeters)
+            guard !Task.isCancelled else { return }
+            // Re-check the toggle after the network await, and that we're
+            // still free-riding (a nav start during the await owns the layer).
+            guard self.dashNavSettings.speedCamerasEnabled, self.isFreeRiding else { return }
+            // MAP ONLY — deliberately NOT handed to activeNavLoop so the
+            // announcer never speaks these in free-ride.
+            self.mapViewSource.setSpeedCameras(cams)
+        }
+    }
+
+    /// Tear down a free-ride projection: stop the stream (which sends the
+    /// dash's nav-stop sequence, stops the ActiveNavLoop, and freezes the
+    /// ride totals for the post-ride GPX export panel) and clear the
+    /// free-ride flag so the picker remounts the live map.
+    func stopFreeRide() {
+        guard isFreeRiding else { return }
+        isFreeRiding = false
+        freeRideFixSubscription = nil
+        // Free-ride markers must not linger onto a later nav map (a nav
+        // start whose camera fetch fails never replaces them).
+        mapViewSource.setSpeedCameras([])
+        stopStreaming()
+    }
+
+    /// Re-evaluate whether the wakelocks should be active. Called any
+    /// time `keepAwakeWhileStreaming` toggles, the streaming state
+    /// changes, or `bikeLink.state` flips. The keepers only burn
+    /// battery while ALL three preconditions hold:
+    ///   1. user wants screen-off survival,
+    ///   2. we're streaming or a ride is in progress (`hasStreamingIntent`),
+    ///   3. the bike link is up or reconnecting — otherwise we'd be shoving
+    ///      UDP into a black hole and holding the app alive for no reason.
+    private func applyKeepAwake() {
+        // `isStreaming` alone is the WRONG gate here, and it caused a
+        // self-sustaining deadlock in the field (log 1/9/2026):
+        //
+        //   1. the bike is switched off → Wi-Fi drops
+        //   2. RtpStreamer fails → `isStreaming` goes false
+        //   3. the link leaves .connected → `.reconnecting`
+        //   4. BOTH old conditions are now false → the wakelock is RELEASED
+        //   5. with the screen off and the phone in a pocket, iOS suspends
+        //      the app within seconds
+        //   6. the reconnect loop can no longer run at any useful rate, so
+        //      the stream never comes back → step 4 stays true forever
+        //
+        // The measurement that proves it: `waitForWifiReady` has a HARD
+        // ceiling of 5 s (20 × 250 ms), yet the log shows
+        //     08:29:12.944  [0ms]      Waiting for Wi-Fi to be ready…
+        //     08:32:12.055  [179112ms] Wi-Fi ready after 3750ms
+        // — 15 iterations of a 250 ms sleep taking 179 REAL seconds
+        // (~12 s per sleep), and it only completed at the instant the rider
+        // picked the phone up (`scenePhase → inactive` 0.5 s earlier).
+        //
+        // So the wakelock was dropped at exactly the moment it was most
+        // needed. Gate on the rider's INTENT to stream instead: while a
+        // ride is in progress we must stay alive across the reconnect gap,
+        // not just while frames happen to be flowing. Once the rider stops
+        // (or arrives), intent goes false and the wakelock is released as
+        // before — an idle app still never holds it.
+        //
+        // The link condition is relaxed the same way: `.reconnecting` is
+        // precisely the state we must survive. `.idle`/`.error` are not —
+        // there is nothing to come back to, so we stop burning battery.
+        let linkWorthStayingAwakeFor = bikeLink.state == .connected
+            || bikeLink.state == .reconnecting
+        let shouldRun = keepAwakeWhileStreaming
+            && (isStreaming || hasStreamingIntent)
+            && linkWorthStayingAwakeFor
+        // The audio session follows the wakelock EDGES, not every call: a
+        // re-assert here would run `setCategory` without `.duckOthers` and
+        // un-duck music mid-prompt (e.g. the arrival prompt, spoken just
+        // before the intent observer lands here).
+        if shouldRun {
+            if wakelockToken == nil {
+                wakelockToken = locationService.start(mode: .wakelock)
+                voiceNavigator.startSession()
+            }
+            UIApplication.shared.isIdleTimerDisabled = true
+        } else {
+            if let token = wakelockToken {
+                locationService.stop(token: token)
+                wakelockToken = nil
+                // Arriving mid-reconnect releases the wakelock right after
+                // `onArrived` started "You have arrived"; `stopSession()`
+                // would cut it. Let it finish — the idle session is harmless
+                // and the next ride's wakelock take re-asserts it.
+                if !activeNavigator.hasArrived {
+                    voiceNavigator.stopSession()
+                }
+            }
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
+    }
+
+    // MARK: - Navigation (Phase 7)
+
+    /// Persisted favorites + route preferences. UI binds the search
+    /// sheet / favorites tiles / preferences panel to this directly.
+    let navigationStore = NavigationStore()
+
+    /// Persisted library of imported GPX routes (feat/saved-routes-gpx).
+    /// The "Saved routes" sheet binds to this; navigating one builds a
+    /// fresh `PlannedRoute` via `beginPlanningFromSavedRoute`.
+    let savedRoutesStore = SavedRoutesStore()
+
+    /// Persisted recent-search history (feat/search-history). The
+    /// destination search sheet shows this in its empty state and records a
+    /// pick here on selection.
+    let recentDestinationsStore = RecentDestinationsStore()
+
+    /// One-shot signal from the saved-route detail screen asking the
+    /// picker to tear down the (possibly multi-level) Saved Routes sheet
+    /// after a route was staged for navigation, so the planning UI is
+    /// visible underneath. The picker observes this, dismisses, and
+    /// resets it to false.
+    var requestDismissSavedRoutes = false
+
+    /// Active turn-by-turn session. `start(route:destination:)` flips
+    /// `isNavigating` true; stop() resets. Reroute requests are wired
+    /// through `onRerouteRequested` in init below.
+    let activeNavigator = ActiveNavigator()
+
+    /// System music-player control for the dash now-playing screen's
+    /// prev/next-track buttons. Stateless wrapper; see DashMediaControl.
+    let dashMediaControl = DashMediaControl()
+
+    /// User-facing dash display preferences (units, decimal separator,
+    /// clock format, ETA-vs-distance bottom row). Persisted, observable.
+    let dashNavSettings = DashNavSettings()
+
+    /// User-facing map appearance preference (Light / Dark / Auto).
+    /// Persisted, observable. `MapStyleResolver` maps this + the live GPS
+    /// fix + clock onto `effectiveMapStyle`.
+    let mapStyleSettings = MapStyleSettings()
+
+    /// The concrete palette currently driving the renderer. Mirrors
+    /// `mapViewSource.currentStyle`; kept here so the settings UI can show
+    /// "Currently: Dark" under the Auto picker.
+    private(set) var effectiveMapStyle: MapStyle = .light
+
+    /// When the effective palette last changed — feeds the resolver's
+    /// dwell lock so Auto can't strobe.
+    @ObservationIgnored private var lastStyleSwitchAt: Date?
+
+    /// Throttle for the solar re-evaluation: the sun moves ~0.25°/min, so
+    /// re-checking once a minute is ample and keeps us off the per-fix
+    /// hot path.
+    @ObservationIgnored private var lastStyleEvalAt: Date?
+
+    /// Active-nav 1 Hz pump. Created on demand when streaming starts
+    /// (we need a live `mapSource` and `bikeLink.connected` first). Held
+    /// here so we can stop it from `stopStreaming()`.
+    @ObservationIgnored private var activeNavLoop: ActiveNavLoop? {
+        // The camera prefetch usually finishes (disk-cache hit) BEFORE
+        // `startStreaming` creates the loop, so seed a new loop with the
+        // last result instead of relying on the prefetch to find it.
+        didSet {
+            activeNavLoop?.setSpeedCameras(speedCameraData.cameras)
+            activeNavLoop?.setSpeedSections(speedCameraData.sections)
+        }
+    }
+    /// Cameras + sections collected for the current ride (`.empty` when
+    /// the toggle is off). Seeds `activeNavLoop` on creation.
+    @ObservationIgnored private var speedCameraData: SpeedCameraData = .empty
+    /// Areas already fetched (or being fetched) for this ride. A reroute or
+    /// leg whose route fits inside one of them needs no new query.
+    @ObservationIgnored private var speedCameraCoverage: [SpeedCameraService.BBox] = []
+    /// Bumped on every fresh start / toggle-off so a late fetch from an
+    /// earlier ride can't merge into the current one.
+    @ObservationIgnored private var speedCameraGeneration = 0
+
+    /// Live Activity controller (Lock Screen + Dynamic Island ride card).
+    /// Created on `startStreaming`, fed by `ActiveNavLoop`, ended on
+    /// `stopStreaming`. nil while not streaming.
+    @ObservationIgnored private var liveActivity: LiveActivityController?
+
+    /// One-shot route calculator used by the route preview sheet and
+    /// by the navigator's reroute callback.
+    let routingService = RoutingService()
+
+    // MARK: - Multi-stop planning (feat/route-waypoints)
+
+    /// The live multi-stop plan being built in the picker's planning
+    /// mode. nil when not planning. The PlanningMapView + WaypointList
+    /// both bind to this same instance; mutating it redraws both.
+    var plannedRoute: PlannedRoute? = nil
+
+    /// Leg indices currently being recomputed — surfaced to the
+    /// waypoint list so it can show per-row spinners.
+    var recomputingLegs: Set<Int> = []
+
+    /// Begin planning from a single destination (the n=2 case): origin
+    /// = current location, destination = `dest`. Builds the plan and
+    /// kicks off the initial leg computation. Returns immediately; the
+    /// plan fills in asynchronously.
+    func beginPlanning(to dest: Destination) {
+        let originCoord = locationService.lastFix?.coordinate
+            ?? CLLocationCoordinate2D(latitude: dest.coordinate.latitude,
+                                      longitude: dest.coordinate.longitude)
+        let origin = Waypoint.currentLocation(originCoord)
+        let destination = Waypoint.from(destination: dest)
+        let plan = PlannedRoute(origin: origin, destination: destination)
+        plannedRoute = plan
+        Task { await recomputeDirtyLegs(plan.allLegIndices, in: plan) }
+    }
+
+    /// Begin planning from a saved (imported) route. Builds a
+    /// `PlannedRoute` whose origin is the live GPS fix and whose via /
+    /// destination waypoints are the saved route's points (truncated to
+    /// the chosen start mode), then kicks off leg computation.
+    ///
+    /// This produces the SAME `PlannedRoute` shape the manual planner
+    /// makes, so everything downstream — the connect-first "Start
+    /// navigation" CTA, auto-start on connect, per-leg recompute,
+    /// reroute, arrival teardown, and the dash maneuver-glyph pump — is
+    /// reused with zero changes. A saved route is just a pre-seeded plan.
+    ///
+    /// `.fromNearest` drops the leading points before `nearestIndex` so
+    /// the rider joins the route at the closest point; `.fromFirst` keeps
+    /// the whole route. The origin is ALWAYS the live location (so
+    /// MKDirections has a real source and the first leg routes the rider
+    /// onto the saved geometry).
+    func beginPlanningFromSavedRoute(_ route: SavedRoute,
+                                     mode: RouteStartMode,
+                                     nearestIndex: Int) {
+        let selected = RouteStartPlanner.droppingReachedStart(
+            RouteStartPlanner.navigablePoints(route.points, mode: mode, nearestIndex: nearestIndex),
+            riderLocation: locationService.lastFix?.coordinate)
+        // A `.track` route carries its FULL precise geometry (potentially
+        // thousands of points). MKDirections is one call per leg and Apple
+        // rate-limits it, so reduce a track to ≤navigableCap significant
+        // via-points HERE, at navigation time, with Douglas–Peucker. The
+        // saved route's own `points` stay untouched (preview map + GPX keep
+        // full precision). `.waypoints` routes are already sparse real
+        // stops — never reduced.
+        let navPoints = route.kind == .track
+            ? GPXGeometry.reduce(selected, cap: RoutePoint.navigableCap)
+            : selected
+        guard navPoints.count >= 1 else { return }
+
+        let originCoord = locationService.lastFix?.coordinate
+            ?? navPoints[0].coordinate
+        let origin = Waypoint.currentLocation(originCoord)
+
+        // Map saved RoutePoints → Waypoints. First/last get friendly
+        // fallback names; named GPX points keep their label.
+        let routeWaypoints: [Waypoint] = navPoints.enumerated().map { idx, p in
+            let fallback = idx == navPoints.count - 1 ? "Route end"
+                         : (route.kind == .waypoints ? "Stop \(idx + 1)" : "Via \(idx + 1)")
+            return Waypoint(name: p.name ?? fallback,
+                            addressLine: nil,
+                            coordinate: p.coordinate,
+                            isCurrentLocation: false)
+        }
+
+        let plan = PlannedRoute(waypoints: [origin] + routeWaypoints)
+        // Track via-points are shape, not stops → HUD presents start→finish.
+        plan.isTrack = (route.kind == .track)
+        plan.isFromLibrary = true
+        plannedRoute = plan
+        Task { await recomputeDirtyLegs(plan.allLegIndices, in: plan) }
+    }
+
+    /// Build a save of the live plan to Saved routes, so a route planned at
+    /// home can be started later from the library. Every point is kept, the live
+    /// "Current location" origin included — as a fixed point at the latest
+    /// fix, named after the place (reverse geocode; coordinates offline).
+    /// A rider who doesn't want it removes it from the plan first.
+    /// Skipped for a plan launched FROM the library (`isFromLibrary`).
+    /// Saving the same plan again (stops edited, a pin got its real name)
+    /// overwrites the entry it was saved to — re-reading the fix, so the
+    /// saved origin follows the rider if they re-save elsewhere; if the
+    /// rider deleted that entry, it is added anew.
+    ///
+    /// Two steps around the planner's name prompt: this one builds the
+    /// route (the geocode is the slow part) and suggests a name — a custom
+    /// one the plan was saved under before (typed, or renamed in the
+    /// library), else the automatic `First → Last` of the points as they are
+    /// now, so an old automatic name doesn't stick to changed stops;
+    /// `commitPlanSave` stores it.
+    /// `plan` is returned and held strongly, so a Start/Cancel during the
+    /// geocode doesn't lose what the rider asked to save.
+    func draftPlanSave() async -> (plan: PlannedRoute, route: SavedRoute, suggestedName: String)? {
+        guard let plan = plannedRoute, !plan.isFromLibrary else { return nil }
+        var here: CLLocationCoordinate2D?
+        var hereName: String?
+        if let origin = plan.waypoints.first(where: \.isCurrentLocation) {
+            let coord = locationService.lastFix?.coordinate ?? origin.coordinate
+            here = coord
+            let placemark = try? await CLGeocoder().reverseGeocodeLocation(
+                CLLocation(latitude: coord.latitude, longitude: coord.longitude)).first
+            hereName = placemark?.name ?? placemark?.locality
+        }
+        guard let route = SavedRoute.fromPlan(
+                  plan.waypoints,
+                  roadDistanceMeters: plan.isComputed ? plan.totalDistanceMeters : nil,
+                  currentLocation: here,
+                  currentLocationName: hereName)
+        else { return nil }
+        let previous = savedRoutesStore.routes.first { $0.id == plan.savedRouteId }
+        return (plan, route, previous?.customName ?? route.name)
+    }
+
+    /// Store a `draftPlanSave` route under the rider's name (blank → the
+    /// automatic one).
+    @discardableResult
+    func commitPlanSave(_ route: SavedRoute, named name: String, for plan: PlannedRoute) -> SavedRoute {
+        let saved = savedRoutesStore.save(route, named: name, replacing: plan.savedRouteId)
+        plan.savedRouteId = saved.id
+        return saved
+    }
+
+    /// Recompute the given dirty legs of `plan` (defaults to the live
+    /// `plannedRoute`). Tracks `recomputingLegs` for the UI spinner and
+    /// surfaces failures into `planError`.
+    ///
+    /// The `plan` argument is captured strongly and `RoutingService`
+    /// mutates it AFTER each `await calculateLeg(...)` — a network round
+    /// trip of ~1 s per leg. If the rider cancels planning (or starts a
+    /// different plan) while that is in flight, the task resumes and
+    /// writes into a `PlannedRoute` that is no longer `plannedRoute`.
+    /// That object is still `@Observable` and still has the SwiftUI
+    /// observers registered by the Stops `List`, so the late write fires
+    /// an observation change into a view SwiftUI has already begun
+    /// tearing down — the "Invalid Number Of Items In Section" abort
+    /// reported from TestFlight on 1.0.3.
+    ///
+    /// The guard is to stop as soon as the plan is no longer live.
+    /// Checked BOTH before and after the await: before, so an already
+    /// stale call never starts; after, because that is the window the
+    /// crash actually lands in.
+    func recomputeDirtyLegs(_ dirty: Set<Int>, in plan: PlannedRoute? = nil) async {
+        guard let plan = plan ?? plannedRoute, !dirty.isEmpty else { return }
+        // Identity, not equality — `PlannedRoute` is a reference type and
+        // this asks "is this still the plan the UI is bound to?".
+        guard plannedRoute === plan else { return }
+        recomputingLegs.formUnion(dirty)
+        defer { recomputingLegs.subtract(dirty) }
+        do {
+            try await routingService.recompute(
+                plan,
+                dirtyLegIndices: dirty,
+                preferences: navigationStore.routePreferences,
+                // Stop writing into the plan the moment it stops being the
+                // live one — checked inside the per-leg loop, so a cancel
+                // mid-recompute abandons the remaining legs instead of
+                // mutating a detached @Observable the UI is tearing down.
+                isStillLive: { [weak self] in self?.plannedRoute === plan }
+            )
+            // The rider may have cancelled while the legs were computing.
+            // Publishing `planError`/clearing it would mutate state the
+            // torn-down planning UI is still observing.
+            guard plannedRoute === plan else { return }
+            planError = nil
+        } catch {
+            guard plannedRoute === plan else { return }
+            planError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// Last planning/recompute error, surfaced in the planning UI.
+    var planError: String? = nil
+
+    // MARK: - Shared-destination entry ("Share to TripperDash++")
+
+    /// A search hint handed over from a shared link we couldn't geocode —
+    /// the planning UI reads this to pre-fill its search field so the rider
+    /// can finish the lookup manually. Cleared once consumed.
+    var pendingSearchHint: String? = nil
+
+    /// A share that arrived mid-ride, parked (latest wins) until the picker
+    /// is back and replays it through `beginPlanningFromShared`. Staging
+    /// during a ride would be wiped by the next `stopNavigation()`.
+    var pendingShare: ShareResolution? = nil
+
+    private var rideActive: Bool { activeNavigator.isNavigating || isFreeRiding }
+
+    private func parkShare(_ resolution: ShareResolution) {
+        pendingShare = resolution
+        pendingSearchHint = nil   // older than this share
+        mapViewSource.showNotice(
+            DashNotice(text: "Share saved for later", level: .info, duration: 5)
+        )
+    }
+
+    /// Pre-fill the planner from a resolved shared payload (Google/Apple
+    /// Maps "Share to TripperDash++"). Coordinates → staged `PlannedRoute`
+    /// exactly like a saved-route import (origin = live location, shared
+    /// stops as waypoints). A name-only payload (Google frequently shares a
+    /// place name with NO coordinates) is first geocoded via MKLocalSearch
+    /// and, if that lands, routed to directly; only if geocoding fails do we
+    /// fall back to `pendingSearchHint` so the rider can finish by hand.
+    /// Returns whether anything actionable was staged.
+    @discardableResult
+    func beginPlanningFromShared(_ resolution: ShareResolution, replay: Bool = false) async -> Bool {
+        // Nothing actionable: leave a parked share alone.
+        guard resolution != .empty else { return false }
+        if rideActive {
+            parkShare(resolution)
+            return true
+        }
+        // Latest wins: a share handled now supersedes one parked earlier
+        // (e.g. the ride ended under an open sheet, then the rider shared again).
+        pendingShare = nil
+        switch resolution {
+        case .empty:
+            return false
+
+        case .searchHint(let hint):
+            // Try to turn the bare label into a real routed destination
+            // before falling back to the manual search field.
+            if let dest = await geocodeSharedName(hint) {
+                stagePlan(to: [Waypoint(name: dest.name,
+                                        addressLine: dest.addressLine,
+                                        coordinate: dest.coordinate,
+                                        isCurrentLocation: false)], replay: replay)
+                return true
+            }
+            pendingSearchHint = hint
+            return true
+
+        case .waypoints(let resolved):
+            // Build a stop for each shared waypoint. A stop with coordinates
+            // is used as-is; a name-only stop (Google's route share carries
+            // daddr=<place name> with no coords) is geocoded in place so the
+            // full route — not just the located legs — is planned. Bias each
+            // geocode to the previous located stop (or the live fix) so an
+            // ambiguous name resolves near the route.
+            var stops: [Waypoint] = []
+            var lastCoord = locationService.lastFix?.coordinate
+            for r in resolved {
+                if let c = r.coordinate {
+                    stops.append(Waypoint(name: r.name?.isEmpty == false ? r.name! : "Stop \(stops.count + 1)",
+                                          addressLine: nil,
+                                          coordinate: c,
+                                          isCurrentLocation: false))
+                    lastCoord = c
+                } else if let name = r.name, !name.isEmpty {
+                    if let dest = await LocalSearchService().geocode(name, near: lastCoord) {
+                        stops.append(Waypoint(name: dest.name,
+                                              addressLine: dest.addressLine,
+                                              coordinate: dest.coordinate,
+                                              isCurrentLocation: false))
+                        lastCoord = dest.coordinate
+                    }
+                    // Unresolvable named stop: skip it rather than abort the
+                    // whole route — a later stop may still be routable.
+                }
+            }
+            guard !stops.isEmpty else {
+                // Nothing routable at all — offer the first label for manual
+                // search so the share is never a dead end.
+                if let name = resolved.first(where: { $0.name?.isEmpty == false })?.name {
+                    pendingSearchHint = name
+                    return true
+                }
+                return false
+            }
+
+            // Google's saddr is the rider's own start; if the first stop is
+            // essentially the live fix, drop it so stagePlan's origin isn't
+            // duplicated. Otherwise keep every shared stop.
+            if stops.count >= 2, let fix = locationService.lastFix?.coordinate,
+               Self.isSameSpot(stops[0].coordinate, fix) {
+                stops.removeFirst()
+            }
+            stagePlan(to: stops, replay: replay)
+            return true
+        }
+    }
+
+    /// Two coordinates within ~150 m of each other (used to detect that a
+    /// shared route's start point is just the rider's current location).
+    private static func isSameSpot(_ a: CLLocationCoordinate2D,
+                                   _ b: CLLocationCoordinate2D) -> Bool {
+        let la = CLLocation(latitude: a.latitude, longitude: a.longitude)
+        let lb = CLLocation(latitude: b.latitude, longitude: b.longitude)
+        return la.distance(from: lb) < 150
+    }
+
+    /// Geocode a shared place label into a routable destination, biased to
+    /// the rider's current location so an ambiguous name resolves nearby.
+    private func geocodeSharedName(_ name: String) async -> Destination? {
+        let near = locationService.lastFix?.coordinate
+        return await LocalSearchService().geocode(name, near: near)
+    }
+
+    /// Stage a `PlannedRoute` from the live location through the given stops
+    /// and kick off leg routing. Shared by the coordinate and geocoded-name
+    /// paths so both behave identically.
+    private func stagePlan(to stops: [Waypoint], replay: Bool = false) {
+        let shared = ShareResolution.waypoints(stops.map { ResolvedWaypoint(coordinate: $0.coordinate, name: $0.name) })
+        // A ride may have started while the shared name was geocoding.
+        guard !rideActive else {
+            parkShare(shared)
+            return
+        }
+        // A replayed share must not replace a plan the rider started while
+        // it was geocoding; it waits again (already announced when parked).
+        guard !(replay && plannedRoute != nil) else {
+            pendingShare = shared
+            return
+        }
+        let originCoord = locationService.lastFix?.coordinate
+            ?? stops[0].coordinate
+        let origin = Waypoint.currentLocation(originCoord)
+        let plan = PlannedRoute(waypoints: [origin] + stops)
+        plannedRoute = plan
+        pendingSearchHint = nil
+        Task { await recomputeDirtyLegs(plan.allLegIndices, in: plan) }
+    }
+
+    /// Handle a `tripperdash://` deep link (posted by the share extension
+    /// after it resolves a payload, or a direct `geo:` / maps URL the OS
+    /// routes to us). Resolves and stages a plan. Async because a Google
+    /// short-link may need a redirect follow.
+    func handleIncomingURL(_ url: URL) {
+        // Our own scheme carries the already-resolved payload in the query
+        // (coords/labels the extension extracted). Everything else is a
+        // raw shared URL we resolve here.
+        Task {
+            let resolution: ShareResolution
+            if url.scheme?.lowercased() == "tripperdash" {
+                if (url.host ?? "").lowercased() == "open",
+                   let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                   let rawStr = comps.queryItems?.first(where: { $0.name == "url" })?.value,
+                   let raw = URL(string: rawStr) {
+                    // Extension couldn't resolve the short-link under its
+                    // network sandbox and passed the raw maps URL through —
+                    // resolve it here (normal network, full redirect follow).
+                    shareLog.info("passthrough resolve raw=\(raw.absoluteString, privacy: .private)")
+                    resolution = await SharedDestinationResolver.resolve(text: nil, url: raw)
+                } else {
+                    resolution = SharedDeepLink.decode(url)
+                }
+            } else {
+                resolution = await SharedDestinationResolver.resolve(text: nil, url: url)
+            }
+            shareLog.info("resolution=\(String(describing: resolution), privacy: .private)")
+            let staged = await beginPlanningFromShared(resolution)
+            shareLog.info("beginPlanningFromShared staged=\(staged, privacy: .public)")
+        }
+    }
+
+
+    /// Exit planning mode and drop the staged plan.
+    func cancelPlanning() {
+        plannedRoute = nil
+        recomputingLegs = []
+        planError = nil
+    }
+
+    /// Wire ActiveNavigator's reroute callback to our RoutingService
+    /// and NavigationStore preferences. Done lazily after init.
+    private func wireNavigation() {
+        // Off-route reroute + ETA-only refresh: both read `.first` only, so
+        // no alternates, and a hard timeout — MKDirections has none, and the
+        // dash shows "recalculating" for as long as a reroute waits.
+        activeNavigator.onRerouteRequested = { [weak self] origin, dest in
+            guard let self else { return nil }
+            do {
+                let opts = try await self.routingService.calculate(
+                    from: origin,
+                    to: dest,
+                    preferences: self.navigationStore.routePreferences,
+                    alternates: false,
+                    timeout: ActiveNavigator.routeRequestTimeout
+                )
+                return opts.first?.route
+            } catch {
+                return nil
+            }
+        }
+
+        // Live-traffic reroute: hand the navigator Apple's full current
+        // traffic-aware alternative set from the rider's live position.
+        // The navigator's pure decision core compares the current
+        // corridor against the fastest DISTINCT alternative and swaps
+        // only when the saving clears the user's threshold.
+        activeNavigator.onTrafficRoutesRequested = { [weak self] origin, dest in
+            guard let self else { return [] }
+            do {
+                let opts = try await self.routingService.calculate(
+                    from: origin,
+                    to: dest,
+                    preferences: self.navigationStore.routePreferences,
+                    timeout: ActiveNavigator.routeRequestTimeout
+                )
+                return opts.map(\.route)
+            } catch {
+                return []
+            }
+        }
+
+        // Seed the navigator's traffic-reroute knobs from settings and
+        // keep them in sync when the rider changes them mid-ride.
+        activeNavigator.trafficRerouteEnabled = dashNavSettings.trafficRerouteEnabled
+        activeNavigator.trafficRerouteSavingSeconds = dashNavSettings.trafficRerouteSavingSeconds
+        observeTrafficRerouteSettings()
+        observeStreamingIntent()
+
+        // Final-destination arrival: keep the stream UP so the dash never
+        // blinks out of projection. We DON'T tear the stream down or drop the
+        // route/tile artefacts here anymore — the route + "arrived" state stay
+        // on the live map through the HUD's dismiss beat, then MapPickerView's
+        // finishArrival() swaps to free-ride IN PLACE (no stream restart). Only
+        // the spoken arrival confirmation fires here.
+        activeNavigator.onArrived = { [weak self] in
+            guard let self else { return }
+            // Spoken arrival confirmation. The ActiveNavLoop is still running
+            // (stream up), but a `.critical` prompt pre-empts any lower-tier
+            // guidance in flight. Gated on the voice setting like every other
+            // prompt.
+            if self.dashNavSettings.voiceEnabled {
+                let lang = self.dashNavSettings.voiceLanguage
+                self.voiceNavigator.speak(VoicePhrase.arrived(lang),
+                                          language: lang.rawValue, priority: .critical)
+            }
+        }
+    }
+
+    /// Re-evaluate the wakelock whenever the ride intent flips — navigation
+    /// stop, arrival, dash exit button. During `.reconnecting` `isStreaming`
+    /// is already false, so a stop path that only calls `stopStreaming()`
+    /// `if isStreaming` would otherwise leave the location wakelock held
+    /// until the next link-state change (up to the 30 min reconnect budget).
+    private func observeStreamingIntent() {
+        withObservationTracking {
+            _ = hasStreamingIntent
+        } onChange: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.applyKeepAwake()
+                self.observeStreamingIntent()
+            }
+        }
+    }
+
+    /// Keep the navigator's live-traffic-reroute knobs in sync with the
+    /// user settings while a ride is in progress. Same self-re-registering
+    /// `withObservationTracking` idiom as `observeCallStateToggle()`. Both
+    /// the enable flag and the saving threshold are mirrored, so flipping
+    /// the toggle or nudging the minutes stepper mid-ride takes effect on
+    /// the next periodic check without restarting navigation.
+    private func observeTrafficRerouteSettings() {
+        withObservationTracking {
+            _ = dashNavSettings.trafficRerouteEnabled
+            _ = dashNavSettings.trafficRerouteSavingSeconds
+        } onChange: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.activeNavigator.trafficRerouteEnabled = self.dashNavSettings.trafficRerouteEnabled
+                self.activeNavigator.trafficRerouteSavingSeconds = self.dashNavSettings.trafficRerouteSavingSeconds
+                self.observeTrafficRerouteSettings()
+            }
+        }
+    }
+
+    // MARK: - Call-state observer (incoming-call card on the dash)
+
+    /// Owns the CallKit bridge for the app's lifetime. Held here (not a
+    /// local) so the `CXCallObserver` inside keeps its delegate alive — a
+    /// dropped observer silently stops delivering call events.
+    @ObservationIgnored private var callObserver: CallStateObserver?
+
+    // MARK: - Ride alerts (weather pill + speed cameras)
+
+    /// Keyless weather provider for the dash weather pill. Owned for the
+    /// app's lifetime so its throttle state + URLSession persist across
+    /// start/stop streaming. Polled (throttled) from `navigatorIngest`
+    /// using the rider's live position + the route-ahead polyline.
+    @ObservationIgnored private let weatherService = WeatherAlertService()
+
+    /// Guards against overlapping speed-camera prefetches when several
+    /// route installs land close together (start + immediate reroute).
+    @ObservationIgnored private var speedCameraPrefetchTask: Task<Void, Never>?
+    @ObservationIgnored private var speedLimitPrefetchTask: Task<Void, Never>?
+    /// Box of the speed-limit ways loaded (or being fetched) for this ride.
+    @ObservationIgnored private var speedLimitCoverage: SpeedLimitService.BBox?
+
+    /// Start observing system call state and forwarding it to the dash.
+    /// Like the stock app, call changes become K1G
+    /// `05 21`/`05 4D` bursts over the existing nav control plane. No-op
+    /// when not connected (handled inside `BikeLink.sendCallState`), so it's
+    /// safe to start once at launch and leave running for the whole session.
+    private func wireCallObserver() {
+        let obs = CallStateObserver(link: bikeLink)
+        callObserver = obs
+        obs.start()
+        observeCallStateToggle()
+    }
+
+    /// Watch the `callStateEnabled` preference so that turning the card OFF
+    /// while one is lit clears it on the dash immediately. We push a `.none`
+    /// (which `BikeLink.sendCallState` lets through even when disabled) on
+    /// the OFF transition. Turning it back ON does nothing here — the next
+    /// real CallKit event re-syncs the live state. Same self-re-registering
+    /// `withObservationTracking` idiom as `observeBikeLink()`.
+    private func observeCallStateToggle() {
+        withObservationTracking {
+            _ = dashNavSettings.callStateEnabled
+        } onChange: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                if self.dashNavSettings.callStateEnabled == false {
+                    await self.bikeLink.sendCallState(.none)
+                }
+                self.observeCallStateToggle()
+            }
+        }
+    }
+
+    // MARK: - Device telemetry (phone status → dash heartbeat)
+
+    /// Owns the live phone-status provider for the app's lifetime. Held
+    /// here (not a local) so its battery-notification observers and the
+    /// `NWPathMonitor` inside keep running — a dropped provider silently
+    /// stops sampling and the heartbeat would freeze on stale values.
+    @ObservationIgnored private var deviceTelemetry: DeviceTelemetry?
+
+    /// Stand up the phone-status provider and hand `BikeLink` a `@Sendable`
+    /// snapshot closure it can call once per heartbeat tick. Mirrors the
+    /// Begin streaming the phone's own status into the dash heartbeat,
+    /// matching the stock app's 1 Hz status frames
+    /// (battery / GPS / charging / signal). Always on — the stock app
+    /// reports unconditionally and so do we; there's no user setting.
+    /// Safe to call once at launch: the provider runs for the whole session
+    /// and `BikeLink` only consults it while the heartbeat loop is alive
+    /// (i.e. while connected).
+    private func wireDeviceTelemetry() {
+        let tele = DeviceTelemetry(location: locationService)
+        deviceTelemetry = tele
+        tele.start()
+        // `snapshot()` is main-actor isolated; the closure stays valid for
+        // the whole session.
+        bikeLink.telemetryProvider = { @Sendable [weak tele] in
+            guard let tele else { return .placeholder }
+            return await tele.snapshot()
+        }
+    }
+
+    /// Route decoded dash joystick events to app behaviour. Runs once at
+    /// launch; `BikeLink` invokes `onButton` on the main actor after it has
+    /// already sent the wire ack.
+    ///
+    /// The dash sends CONTEXT-DEPENDENT codes (it knows which of its own
+    /// screens is up), so each maps to a semantic action rather than a raw
+    /// stick direction. Confirmed from on-bike captures 2026-08-11:
+    ///   Map screen:
+    ///     RIGHT → zoom in    LEFT → zoom out
+    ///     DOWN  → reserved    CLICK → reserved (Phase 3 on-map menu)
+    ///   Now-playing screen (same stick, different codes):
+    ///     nextTrack → skip forward   prevTrack → skip back
+    ///   In-menu:
+    ///     removeWaypoint → skip the upcoming intermediate stop
+    ///     exitNav        → end the whole ride (same as tapping "End")
+    ///
+    /// The dash handles "open menu" and the "up" that opens it locally and
+    /// never sends them to the phone, so there is nothing to wire for those.
+    private func wireDashButtons() {
+        bikeLink.onButton = { [weak self] button in
+            guard let self else { return }
+            switch button {
+            case .right:
+                self.mapViewSource.applyZoomButton(zoomIn: true)
+            case .left:
+                self.mapViewSource.applyZoomButton(zoomIn: false)
+            case .down, .click:
+                // Reserved — no action yet (see Phase 3 menu idea).
+                break
+            case .nextTrack:
+                self.dashMediaControl.skipToNext()
+            case .prevTrack:
+                self.dashMediaControl.skipToPrevious()
+            case .removeWaypoint:
+                Task { await self.activeNavigator.skipCurrentLeg() }
+            case .exitNav:
+                self.activeNavigator.onExitNavRequested?()
+            }
+        }
+    }
+
+    /// Forward GPS fixes into ActiveNavigator. Called from the picker
+    /// once per LocationService update.
+    func navigatorIngest(_ fix: Fix) {
+        // Top up the rolling tile-bake window. Throttled inside
+        // MapViewSource so we don't hammer URLSession on every fix.
+        mapViewSource.extendTileCache(near: fix.coordinate)
+        // Re-evaluate the Auto map style (sun position). Throttled to
+        // ~60 s — far coarser than the GPS fix rate, fine for the sun.
+        maybeUpdateMapStyle(fix)
+        // Ride-relevant weather, throttled inside the service (≥5 min /
+        // ~1 km). Off entirely when the toggle is disabled, and the
+        // pill is cleared so a stale warning doesn't linger.
+        refreshWeather(at: fix.coordinate)
+        Task { @MainActor in
+            await activeNavigator.ingest(fix: fix)
+        }
+    }
+
+    /// Poll the weather service (throttled) and push the result into the
+    /// renderer's weather pill. No-op + cleared pill when the rider has
+    /// turned Weather alerts off.
+    private func refreshWeather(at position: CLLocationCoordinate2D) {
+        guard dashNavSettings.weatherAlertsEnabled else {
+            if mapViewSource.weatherAlert != nil {
+                mapViewSource.setWeatherAlert(nil)
+            }
+            return
+        }
+        let ahead = activeNavigator.routeAheadCoordinates
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let alert = await self.weatherService.refresh(position: position, routeAhead: ahead)
+            // Re-check the toggle: the rider may have flipped it OFF during
+            // the await, in which case we must NOT paint a stale pill.
+            self.mapViewSource.setWeatherAlert(
+                self.dashNavSettings.weatherAlertsEnabled ? alert : nil,
+                imperial: self.dashNavSettings.units == .imperial
+            )
+        }
+    }
+
+    /// Prefetch speed cameras + average-speed sections along `route` and
+    /// hand them to the renderer and the nav loop. Best-effort: a failed or
+    /// empty fetch just leaves the map without markers. No-op (and the
+    /// existing markers cleared) when the toggle is off.
+    ///
+    /// `extending: false` (nav start, toggle re-enabled) starts the ride's
+    /// set from scratch. `extending: true` (reroute, leg advance, alt
+    /// switch — the route-changed hook) fetches only when the new route
+    /// leaves the area already covered, and MERGES the result, so the
+    /// cameras and sections of a new road or the next leg show up too.
+    func prefetchSpeedCameras(for route: MKRoute, extending: Bool = false) {
+        let coords = route.polyline.coordinateList()
+        guard coords.count >= 2 else { return }
+        let routeBox = SpeedCameraService.boundingBox(of: coords, bufferMeters: 0)
+        if extending, speedCameraCoverage.contains(where: { $0.contains(routeBox) }) {
+            return
+        }
+        if !extending {
+            speedCameraPrefetchTask?.cancel()
+            speedCameraGeneration += 1
+            speedCameraData = .empty
+            speedCameraCoverage = []
+        }
+        guard dashNavSettings.speedCamerasEnabled else {
+            speedCameraGeneration += 1
+            speedCameraData = .empty
+            speedCameraCoverage = []
+            mapViewSource.setSpeedCameras([])
+            activeNavLoop?.setSpeedCameras([])
+            activeNavLoop?.setSpeedSections([])
+            return
+        }
+        // Claimed up front so the hook firing right after nav start (same
+        // route) doesn't queue a duplicate fetch of the same corridor.
+        let box = SpeedCameraService.boundingBox(of: coords,
+                                                 bufferMeters: SpeedCameraService.corridorBufferMeters)
+        speedCameraCoverage.append(box)
+        let generation = speedCameraGeneration
+        // Extending fetches don't cancel each other (or the start fetch):
+        // results merge, so two quick reroutes both land.
+        let task = Task { @MainActor [weak self] in
+            var retryDelay = AppStatus.speedLimitRetrySeconds
+            while true {
+                let fetched = await SpeedCameraService.shared.camerasAlong(route: coords)
+                guard let self, !Task.isCancelled, generation == self.speedCameraGeneration else { return }
+                if let fetched {
+                    // Re-check the toggle after the network await.
+                    let data = self.speedCameraData.merged(with: fetched)
+                    let effective = self.dashNavSettings.speedCamerasEnabled ? data : .empty
+                    self.speedCameraData = effective
+                    self.mapViewSource.setSpeedCameras(effective.cameras)
+                    // Hand the same set to the active-nav loop so the voice
+                    // announcer can warn when the rider approaches one, plus
+                    // the average-speed sections for the dash section panel.
+                    self.activeNavLoop?.setSpeedCameras(effective.cameras)
+                    self.activeNavLoop?.setSpeedSections(effective.sections)
+                    return
+                }
+                // Total failure (both mirrors down, no cache). Before, only
+                // the next route change outside the box retried, so a ride
+                // whose start fetch timed out (field log 2026-09-28 21:11)
+                // had no cameras at all. Retry on the speed limits' cadence
+                // (60 s, doubling to 600 s) while navigating with the toggle
+                // on. The claim is held meanwhile, so route changes inside
+                // this box don't start parallel fetches; a new ride / free
+                // ride bumps the generation and ends the loop.
+                // ponytail: a failed box stays claimed, so a reroute inside it
+                // won't try its own smaller box; only the whole-route box
+                // retries. Track retrying boxes separately and exclude them
+                // from the containment skip if a log shows a camera query
+                // failing on size (`Speed cameras: … remark: runtime error`).
+                try? await Task.sleep(for: .seconds(retryDelay))
+                retryDelay = min(retryDelay * 2, AppStatus.speedLimitRetryMaxSeconds)
+                guard !Task.isCancelled, generation == self.speedCameraGeneration,
+                      self.activeNavigator.isNavigating,
+                      self.dashNavSettings.speedCamerasEnabled else { return }
+            }
+        }
+        if !extending { speedCameraPrefetchTask = task }
+    }
+
+    /// Prefetch OSM `maxspeed` ways along the freshly-installed route so
+    /// the renderer can map-match the rider's position to a posted limit.
+    /// Same lifecycle as `prefetchSpeedCameras`. No-op (and the sign
+    /// cleared) when the display mode is `.off`. Always pushes the current
+    /// display config first so the renderer's mode/units are fresh even if
+    /// the fetch returns nothing.
+    ///
+    /// `extending` (reroute / leg advance / alternative switch, from the
+    /// route-changed hook): skip when the new route lies inside the box
+    /// already loaded (or in flight) — which also covers the hook firing
+    /// right after nav start with the same route. Otherwise refetch for
+    /// the new route.
+    ///
+    /// A failed fetch (Overpass busy — both field rides of 2026-09-28 lost
+    /// their start fetch this way) is retried after
+    /// `speedLimitRetrySeconds`, then with the delay doubling up to
+    /// `speedLimitRetryMaxSeconds`, while navigating, until it lands or the
+    /// task is replaced (route change outside the box, nav start, `.off`).
+    /// The claim is held meanwhile, so route changes inside the box don't
+    /// pile up parallel fetches. Failure = no limits AND no roads: a
+    /// region with no `maxspeed` tags still returns its roads, and must
+    /// not refetch.
+    func prefetchSpeedLimits(for route: MKRoute, extending: Bool = false) {
+        let coords = route.polyline.coordinateList()
+        if extending, coords.count >= 2, let covered = speedLimitCoverage,
+           covered.contains(SpeedLimitService.boundingBox(of: coords, bufferMeters: 0)) {
+            return
+        }
+        speedLimitPrefetchTask?.cancel()
+        speedLimitCoverage = nil
+        pushSpeedLimitConfig()
+        guard dashNavSettings.speedLimitDisplay != .off else {
+            mapViewSource.setSpeedLimits(.empty)
+            return
+        }
+        guard coords.count >= 2 else { return }
+        let box = SpeedLimitService.boundingBox(of: coords,
+                                                bufferMeters: SpeedLimitService.corridorBufferMeters)
+        speedLimitCoverage = box
+        speedLimitPrefetchTask = Task { @MainActor [weak self] in
+            var retryDelay = AppStatus.speedLimitRetrySeconds
+            while true {
+                let data = await SpeedLimitService.shared.limitsAlong(route: coords)
+                guard let self, !Task.isCancelled else { return }
+                let failed = data.limits.isEmpty && data.roads.isEmpty
+                // A failed refetch mid-ride keeps the ways already loaded;
+                // they still cover whatever the old and new route share.
+                if !(failed && extending) {
+                    // Re-check the mode after the network await.
+                    self.mapViewSource.setSpeedLimits(
+                        self.dashNavSettings.speedLimitDisplay != .off ? data : .empty
+                    )
+                }
+                guard failed else { return }
+                try? await Task.sleep(for: .seconds(retryDelay))
+                // Back off: a whole-route box that is simply too big for
+                // Overpass fails every time; don't hammer it every minute.
+                retryDelay = min(retryDelay * 2, AppStatus.speedLimitRetryMaxSeconds)
+                guard !Task.isCancelled, self.activeNavigator.isNavigating else { return }
+            }
+        }
+    }
+
+    /// First retry of a failed speed-limit fetch during navigation, doubled
+    /// after each further failure up to `speedLimitRetryMaxSeconds`.
+    static let speedLimitRetrySeconds: Double = 60
+    static let speedLimitRetryMaxSeconds: Double = 600
+
+    /// Push the speed-limit display policy (mode + tolerance + units) to
+    /// the renderer. Cheap; safe to call on prefetch and whenever settings
+    /// change. Units are derived from the same `units` setting the camera
+    /// labels use.
+    func pushSpeedLimitConfig() {
+        mapViewSource.setSpeedLimitConfig(
+            mode: dashNavSettings.speedLimitDisplay.rawValue,
+            toleranceKmh: dashNavSettings.speedLimitOverToleranceKmh,
+            imperial: dashNavSettings.units == .imperial
+        )
+    }
+
+    /// Watch the two ride-alert toggles so flipping either OFF mid-ride
+    /// clears its overlay immediately (rather than waiting for the next
+    /// fix / route install). Turning back ON does nothing here — the next
+    /// fix re-polls weather, and the next route install re-prefetches
+    /// cameras. Same self-re-registering `withObservationTracking` idiom
+    /// as the call-state observer.
+    private func wireRideAlerts() {
+        observeWeatherToggle()
+        observeSpeedCameraToggle()
+        observeSpeedLimitMode()
+    }
+
+    private func observeWeatherToggle() {
+        withObservationTracking {
+            _ = dashNavSettings.weatherAlertsEnabled
+        } onChange: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                if self.dashNavSettings.weatherAlertsEnabled == false {
+                    self.mapViewSource.setWeatherAlert(nil)
+                }
+                self.observeWeatherToggle()
+            }
+        }
+    }
+
+    private func observeSpeedCameraToggle() {
+        withObservationTracking {
+            _ = dashNavSettings.speedCamerasEnabled
+        } onChange: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                if self.dashNavSettings.speedCamerasEnabled == false {
+                    self.speedCameraPrefetchTask?.cancel()
+                    self.mapViewSource.setSpeedCameras([])
+                } else if self.dashNavSettings.speedCamerasEnabled,
+                          self.activeNavigator.isNavigating,
+                          let route = self.activeNavigator.activeRoute {
+                    // Re-enabled mid-ride → backfill markers for the
+                    // current route without waiting for the next reroute.
+                    self.prefetchSpeedCameras(for: route)
+                } else if self.dashNavSettings.speedCamerasEnabled, self.isFreeRiding {
+                    // Next fix refetches around the rider through the one
+                    // gated path (link state, retry clock).
+                    self.freeRideAlertCenter = nil
+                }
+                self.observeSpeedCameraToggle()
+            }
+        }
+    }
+
+    /// Observe the speed-limit display mode + tolerance. Any change pushes
+    /// fresh config to the renderer. `.off` clears the sign + cancels the
+    /// fetch; flipping back to a visible mode mid-ride backfills the ways
+    /// for the current route. Self-re-registering, same idiom as the
+    /// camera toggle.
+    private func observeSpeedLimitMode() {
+        withObservationTracking {
+            _ = dashNavSettings.speedLimitDisplay
+            _ = dashNavSettings.speedLimitOverToleranceKmh
+            _ = dashNavSettings.units
+        } onChange: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.pushSpeedLimitConfig()
+                if self.dashNavSettings.speedLimitDisplay == .off {
+                    self.speedLimitPrefetchTask?.cancel()
+                    self.mapViewSource.setSpeedLimits(.empty)
+                } else if self.mapViewSource.speedLimitWaysEmpty,
+                          self.activeNavigator.isNavigating,
+                          let route = self.activeNavigator.activeRoute {
+                    // Turned on mid-ride with no ways loaded → backfill.
+                    self.prefetchSpeedLimits(for: route)
+                } else if self.mapViewSource.speedLimitWaysEmpty, self.isFreeRiding {
+                    self.freeRideAlertCenter = nil   // next fix refetches (gated path)
+                }
+                self.observeSpeedLimitMode()
+            }
+        }
+    }
+
+    /// Throttled Auto-style re-evaluation. For manual modes the resolver
+    /// is a pass-through (still cheap). When the effective palette changes
+    /// we drive `MapViewSource.setMapStyle`, which holds the old tile
+    /// cache visible until the new palette finishes its first bake.
+    private func maybeUpdateMapStyle(_ fix: Fix) {
+        let now = Date()
+        if let last = lastStyleEvalAt, now.timeIntervalSince(last) < 60 { return }
+        lastStyleEvalAt = now
+        let next = MapStyleResolver.resolve(
+            mode: mapStyleSettings.mode,
+            coord: fix.coordinate,
+            date: fix.timestamp,
+            current: effectiveMapStyle,
+            lastSwitch: lastStyleSwitchAt
+        )
+        guard next != effectiveMapStyle else { return }
+        effectiveMapStyle = next
+        lastStyleSwitchAt = now
+        mapViewSource.setMapStyle(next)
+    }
+
+    /// Resolve the effective palette right now (used at navigation start,
+    /// before the first prerender, so the ride opens in the correct
+    /// Light/Dark style) and push it to the renderer's `currentStyle`
+    /// WITHOUT triggering a re-bake (there's no cache yet — the imminent
+    /// prerender will use it).
+    func primeMapStyleForStart() {
+        let coord = locationService.lastFix?.coordinate
+        let next = MapStyleResolver.resolve(
+            mode: mapStyleSettings.mode,
+            coord: coord,
+            date: Date(),
+            current: effectiveMapStyle,
+            lastSwitch: lastStyleSwitchAt
+        )
+        effectiveMapStyle = next
+        lastStyleSwitchAt = Date()
+        lastStyleEvalAt = Date()
+        mapViewSource.setMapStyle(next)
+    }
+
+    /// Apply a manual change of the appearance picker (Light/Dark/Auto).
+    /// Persists the mode and re-resolves immediately (no 60 s throttle —
+    /// the rider just tapped, they expect an instant response). For Auto
+    /// this resolves against the current sun position.
+    func setMapStyleMode(_ mode: MapStyleSettings.Mode) {
+        mapStyleSettings.mode = mode
+        let coord = locationService.lastFix?.coordinate
+        let next = MapStyleResolver.resolve(
+            mode: mode,
+            coord: coord,
+            date: Date(),
+            current: effectiveMapStyle,
+            lastSwitch: nil   // manual action bypasses the dwell lock
+        )
+        lastStyleEvalAt = Date()
+        guard next != effectiveMapStyle else { return }
+        effectiveMapStyle = next
+        lastStyleSwitchAt = Date()
+        mapViewSource.setMapStyle(next)
+    }
+
+    // MARK: - Build info (handy in the diagnostics overlay)
+
+    let buildVersion: String = Bundle.main
+        .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+    let buildNumber: String = Bundle.main
+        .object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+
+    /// Short git commit SHA the build was produced from. Stamped into the
+    /// Info.plist at build time by `tools/stamp-git-sha.sh` (a Run Script
+    /// build phase). Falls back to "dev" for the unstamped source plist or
+    /// "unknown" if the stamp script could not reach git.
+    let buildCommitSHA: String = Bundle.main
+        .object(forInfoDictionaryKey: "GitCommitSHA") as? String ?? "unknown"
+}

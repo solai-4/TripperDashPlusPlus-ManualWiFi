@@ -1,0 +1,280 @@
+//
+//  RideStatsTests.swift
+//  TripperDashPPTests
+//
+//  Unit tests for the pure GPS ride accumulator (`RideStats`). Every
+//  accumulation rule + the tunable drift guard. No actor, no network —
+//  pure folding of scripted fixes.
+//
+
+import Testing
+import Foundation
+import CoreLocation
+@testable import TripperDashPP
+
+struct RideStatsTests {
+
+    /// Build a fix with only the fields the accumulator reads.
+    private func fix(_ lat: Double, _ lon: Double, alt: Double = 0,
+                     speed: Double = 10, acc: Double = 5,
+                     t: TimeInterval) -> Fix {
+        Fix(CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+            altitude: alt, horizontalAccuracy: acc, verticalAccuracy: 5,
+            course: 0, speed: speed,
+            timestamp: Date(timeIntervalSince1970: t)))
+    }
+
+    @Test func accumulatesDistanceAcrossTwoFixes() {
+        var s = RideStats()
+        // ~111 m apart at the equator (0.001° lon ≈ 111.32 m).
+        s = s.folding(fix(0, 0.000, t: 0))
+        s = s.folding(fix(0, 0.001, t: 5))
+        #expect(abs(s.distanceMeters - 111.32) < 1.5)
+    }
+
+    @Test func jitterBelowFloorAddsNoDistance() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0, acc: 5, t: 0))
+        s = s.folding(fix(0, 0.00001, acc: 5, t: 2)) // ~1.1 m < 3 m floor
+        #expect(s.distanceMeters == 0)
+    }
+
+    @Test func stationaryWanderAddsNoDistance() {
+        // Poor signal while stopped: 5–15 m position steps, Doppler ~0.
+        var s = RideStats()
+        s = s.folding(fix(0, 0.00000, speed: 0,   acc: 30, t: 0))
+        s = s.folding(fix(0, 0.00010, speed: 0,   acc: 30, t: 1))  // ~11 m
+        s = s.folding(fix(0, 0.00005, speed: 0.3, acc: 30, t: 2))  // ~5.6 m
+        s = s.folding(fix(0, 0.00018, speed: 0,   acc: 30, t: 3))  // ~14 m
+        #expect(s.distanceMeters == 0)
+        #expect(s.movingSeconds == 0)      // implied 5–14 m/s, Doppler ~0
+        #expect(s.trackPoints.count == 4)
+        // Riding off again counts, from the last wandered point.
+        s = s.folding(fix(0, 0.00118, speed: 10, t: 13))           // ~111 m
+        #expect(abs(s.distanceMeters - 111.32) < 1.5)
+    }
+
+    @Test func slowFixAfterASignalGapKeepsTheGapDistance() {
+        // Tunnel: 60 s without fixes, the first one back reads 0.5 m/s.
+        // The ~1.1 km chord across the gap is real distance.
+        var s = RideStats()
+        s = s.folding(fix(0, 0.00, speed: 20, t: 0))
+        s = s.folding(fix(0, 0.01, speed: 0.5, t: 60))
+        #expect(abs(s.distanceMeters - 1113.2) < 5)
+        #expect(s.movingSeconds == 10)     // capped gap, like before
+    }
+
+    @Test func gapChordIsNoiseUpTo100mAndRealAbove() {
+        // Pins the 2 × accuracyGateMeters bound: after a 15 s gap ending on
+        // a stopped fix, a ~95 m chord is wander, a ~106 m one is real.
+        var near = RideStats()
+        near = near.folding(fix(0, 0, speed: 0, t: 0))
+        near = near.folding(fix(0, 0.00085, speed: 0, t: 15))    // ~94.5 m
+        #expect(near.distanceMeters == 0)
+        #expect(near.movingSeconds == 0)
+        var far = RideStats()
+        far = far.folding(fix(0, 0, speed: 0, t: 0))
+        far = far.folding(fix(0, 0.00095, speed: 0, t: 15))      // ~105.6 m
+        #expect(abs(far.distanceMeters - 105.64) < 1)
+        #expect(far.movingSeconds == 10)
+    }
+
+    @Test func wanderAfterRejectedFixesAddsNothing() {
+        // Under a roof, 60–80 m fixes (rejected by the 50 m gate) stretch
+        // the step to 15 s; the next accepted one wandered ~20 m, Doppler 0.
+        var s = RideStats()
+        s = s.folding(fix(0, 0.00000, speed: 0, acc: 40, t: 0))
+        s = s.folding(fix(0, 0.00009, speed: 0, acc: 70, t: 5))   // rejected
+        s = s.folding(fix(0, 0.00018, speed: 0, acc: 45, t: 15))  // ~20 m
+        #expect(s.acceptedFixCount == 2)
+        #expect(s.distanceMeters == 0)
+        #expect(s.movingSeconds == 0)
+    }
+
+    @Test func unknownSpeedStillCountsDistance() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, speed: -1, t: 0))
+        s = s.folding(fix(0, 0.001, speed: -1, t: 5))
+        #expect(abs(s.distanceMeters - 111.32) < 1.5)
+    }
+
+    @Test func rejectsInaccurateFix() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0, acc: 5, t: 0))
+        s = s.folding(fix(0, 0.001, acc: 80, t: 5)) // 80 m > 50 m gate
+        #expect(s.distanceMeters == 0)
+        #expect(s.acceptedFixCount == 1)
+    }
+
+    @Test func teleportGlitchSkippedForDistanceButClockAdvances() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0, speed: 10, t: 0))
+        // 0.01° lon ≈ 1113 m in 1 s → 1113 m/s ≫ 90 m/s cap → glitch.
+        s = s.folding(fix(0, 0.01, speed: 10, acc: 5, t: 1))
+        #expect(s.distanceMeters == 0)
+        #expect(s.acceptedFixCount == 2) // still accepted, clock advanced
+    }
+
+    @Test func maxSpeedTracksGpsSpeed() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, speed: 12, t: 0))
+        s = s.folding(fix(0, 0.001, speed: 25, t: 5))
+        s = s.folding(fix(0, 0.002, speed: 8,  t: 10))
+        #expect(s.maxSpeedMps == 25)
+    }
+
+    @Test func maxSpeedIgnoresUnknownSpeed() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, speed: -1, t: 0))
+        s = s.folding(fix(0, 0.001, speed: -1, t: 5))
+        #expect(s.maxSpeedMps == 0)
+    }
+
+    @Test func movingTimeCountsOnlyWhileMoving() {
+        var s = RideStats()
+        // Moving 0→5 s (speed 10), stopped 5→30 s (speed 0.1).
+        s = s.folding(fix(0, 0.000, speed: 10,  t: 0))
+        s = s.folding(fix(0, 0.001, speed: 10,  t: 5))
+        s = s.folding(fix(0, 0.001, speed: 0.1, acc: 5, t: 30)) // no move
+        #expect(abs(s.movingSeconds - 5) < 0.01)
+    }
+
+    @Test func movingTimeCapsHugeGap() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, speed: 10, t: 0))
+        // 300 s gap while "moving" → capped at 10 s.
+        s = s.folding(fix(0, 0.050, speed: 10, acc: 5, t: 300))
+        #expect(s.movingSeconds <= 10.0001)
+    }
+
+    @Test func averageSpeedIsMovingAverage() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, speed: 10, t: 0))
+        s = s.folding(fix(0, 0.001, speed: 10, t: 5)) // ~111 m in 5 moving s
+        #expect(abs(s.averageSpeedMps - 111.32 / 5) < 0.5)
+    }
+
+    @Test func averageSpeedZeroWhenNoMovingTime() {
+        #expect(RideStats().averageSpeedMps == 0)
+    }
+
+    @Test func elevationGainCountsAscentAboveHysteresis() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, alt: 100, t: 0))
+        s = s.folding(fix(0, 0.001, alt: 101, t: 5)) // +1 m < 2 m → not yet
+        s = s.folding(fix(0, 0.002, alt: 103, t: 10)) // cumulative +3 m ≥ 2 → count
+        #expect(abs(s.elevationGainMeters - 3) < 0.01)
+    }
+
+    @Test func elevationGainIgnoresDescent() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, alt: 100, t: 0))
+        s = s.folding(fix(0, 0.001, alt: 90,  t: 5))
+        #expect(s.elevationGainMeters == 0)
+    }
+
+    @Test func elapsedIsWallClockSpan() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, speed: 10, t: 100))
+        s = s.folding(fix(0, 0.001, speed: 0.1, t: 160)) // 60 s later, slow fix
+        // Wall clock counts all 60 s even though moving time doesn't.
+        #expect(abs(s.elapsedSeconds - 60) < 0.01)
+    }
+
+    // MARK: - Drift guard (Task 2)
+
+    @Test func tunablesAreTheReviewedValues() {
+        #expect(RideStats.accuracyGateMeters == 50)
+        #expect(RideStats.jitterFloorMeters == 3)
+        #expect(RideStats.teleportSpeedMps == 90)
+        #expect(RideStats.movingThresholdMps == 0.7)
+        #expect(RideStats.maxStepSeconds == 10)
+        #expect(RideStats.ascentHysteresisMeters == 2)
+    }
+
+    // MARK: - Gating coverage (review hardening)
+
+    @Test func rejectsNonMonotonicTimestamp() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, t: 10))
+        s = s.folding(fix(0, 0.001, t: 5)) // earlier than last → rejected
+        #expect(s.acceptedFixCount == 1)
+        #expect(s.distanceMeters == 0)
+    }
+
+    @Test func rejectsDuplicateTimestamp() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, t: 10))
+        s = s.folding(fix(0, 0.001, t: 10)) // equal timestamp → rejected
+        #expect(s.acceptedFixCount == 1)
+    }
+
+    @Test func rejectsNegativeAccuracy() {
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, acc: 5, t: 0))
+        s = s.folding(fix(0, 0.001, acc: -1, t: 5)) // invalid accuracy → rejected
+        #expect(s.acceptedFixCount == 1)
+        #expect(s.distanceMeters == 0)
+    }
+
+    @Test func teleportWithUnknownSpeedAddsNoMovingTime() {
+        // A GPS position jump (glitch) with unknown Doppler speed must not
+        // accrue moving time off the bogus implied speed — the blessed
+        // refinement of rule 3 (zero the implied term on a glitch).
+        var s = RideStats()
+        s = s.folding(fix(0, 0, speed: 10, t: 0))
+        s = s.folding(fix(0, 0.01, speed: -1, acc: 5, t: 1)) // ~1113 m/s implied → glitch, speed unknown
+        #expect(s.distanceMeters == 0)
+        #expect(s.movingSeconds == 0)
+        #expect(s.acceptedFixCount == 2)
+    }
+
+    @Test func flatSegmentHoldsAscentBuffer() {
+        // Sub-hysteresis rise, then a FLAT fix, then more rise: the flat
+        // fix must NOT wipe the accumulated buffer (reset is strict-descent
+        // -only), so +1 (flat) +1 crosses the 2 m hysteresis and counts.
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, alt: 100, t: 0))
+        s = s.folding(fix(0, 0.001, alt: 101, t: 5))  // +1 m, buffer=1 (<2)
+        s = s.folding(fix(0, 0.002, alt: 101, t: 10)) // flat, buffer stays 1
+        s = s.folding(fix(0, 0.003, alt: 102, t: 15)) // +1 m, buffer=2 → counts
+        #expect(abs(s.elevationGainMeters - 2) < 0.01)
+    }
+
+    // MARK: - Session lifecycle signals (post-arrival panel gating)
+
+    @Test func startedAtNilBeforeFirstFix() {
+        // The post-arrival panel is gated on `stats.startedAt != nil`, so a
+        // never-ridden accumulator must read as "no ride yet".
+        let s = RideStats()
+        #expect(s.startedAt == nil)
+        #expect(s.distanceMeters == 0)
+    }
+
+    @Test func startedAtSetOnFirstAcceptedFix() {
+        // First accepted fix seeds startedAt → the panel becomes eligible.
+        var s = RideStats()
+        s = s.folding(fix(0, 0, alt: 100, t: 0))
+        #expect(s.startedAt != nil)
+    }
+
+    @Test func foldingContinuesAcrossRides() {
+        // The rider-confirmed model: arriving and starting a fresh route
+        // KEEPS accumulating onto the same totals (a multi-leg day reads as
+        // one ride). The accumulator has no per-ride boundary — only a full
+        // reset() zeroes it — so simply continuing to fold must grow both
+        // the distance and keep the original startedAt.
+        var s = RideStats()
+        s = s.folding(fix(0, 0.000, alt: 100, t: 0))
+        s = s.folding(fix(0, 0.010, alt: 100, t: 30)) // leg 1
+        let afterLeg1 = s.distanceMeters
+        let started = s.startedAt
+        #expect(afterLeg1 > 0)
+        // …arrival, a pause, then a second route resumes onto the SAME value.
+        s = s.folding(fix(0, 0.020, alt: 100, t: 600)) // leg 2, later
+        #expect(s.distanceMeters > afterLeg1)
+        #expect(s.startedAt == started) // origin unchanged → one continuous ride
+    }
+}
+

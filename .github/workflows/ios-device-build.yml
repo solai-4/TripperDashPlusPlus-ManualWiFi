@@ -1,0 +1,48 @@
+name: iOS device build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Build for iPhone
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project TripperDashPP/TripperDashPP.xcodeproj \
+            -scheme TripperDashPP \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package build output
+        run: |
+          mkdir -p unsigned-ipa/Payload
+          APP_PATH="build/Build/Products/Release-iphoneos/TripperDashPP.app"
+          test -d "$APP_PATH"
+          cp -R "$APP_PATH" unsigned-ipa/Payload/
+          cd unsigned-ipa
+          zip -r ../TripperDashPP-unsigned.ipa Payload
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: TripperDashPP-unsigned-IPA
+          path: TripperDashPP-unsigned.ipa
+          if-no-files-found: error

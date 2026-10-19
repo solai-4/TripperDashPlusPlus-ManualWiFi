@@ -1,0 +1,346 @@
+//
+//  H264Encoder.swift
+//  TripperDashPP
+//
+//  Hardware H.264 encoder built on VideoToolbox's VTCompressionSession.
+//
+//  Output shape: for every input CVPixelBuffer the caller receives one or
+//  more `EncodedNAL`s. Each NAL is delivered as raw bytes (no Annex-B
+//  start codes, no length prefix) along with metadata the RTP packetizer
+//  needs (type, isKey, timestamp). The encoder extracts SPS+PPS from the
+//  format description on keyframes and emits them as separate NALs so the
+//  packetizer can either bundle them with the IDR (Tripper expects this)
+//  or send them standalone.
+//
+//  Configuration: baseline profile, 512 kbps, a keyframe every second
+//  (`keyframeInterval` = fps), and a hard data-rate cap equal to the
+//  average bitrate (no burst headroom). The encoder constructor takes fps
+//  as a parameter — RtpStreamer hands it `source.targetFps` (4 fps in
+//  MapViewSource).
+//
+//  This follows the stock Royal Enfield app's stream shape (better-dash
+//  `DASH_FPS` / `DASH_GOP_SEC` / `-maxrate = -b:v`: 4 fps, IDR every 1 s,
+//  no bursts), at 2.5× its 204.8 kbps so street labels stay legible.
+//  History: 450 → 800 → 1200 → 1024 kbps at 6 fps with a 2-s GOP and a 3×
+//  burst window. The rider then saw the picture freeze and break into
+//  fragments until the next keyframe repaired it — the signature of a
+//  lost RTP packet. Every frame leaves as a back-to-back run of 1200-byte
+//  packets, and one lost packet corrupts that frame and every P-frame
+//  after it until the next IDR. At 512 kbps / 4 fps the average frame is
+//  ~16 KB (~13 packets, was ~21 KB / ~18), the cap no longer lets a 1-s
+//  window run to 3× the average bitrate, and the 1-s GOP halves the
+//  worst-case time a corrupted picture stays on the dash.
+//  Above ~12 fps the dash decoder blinks. High profile + B-frames break
+//  the firmware decoder, so those stay off.
+//
+
+import CoreMedia
+import CoreVideo
+import Foundation
+import VideoToolbox
+import os.log
+
+/// One H.264 NAL unit emitted by the encoder.
+///
+/// `nonisolated` + Sendable: handed from the VideoToolbox callback thread
+/// to `RtpSendPipe` on the RTP send queue. `@unchecked` only because of
+/// `CMTime` (a plain C value struct); every field is an immutable value.
+nonisolated struct EncodedNAL: @unchecked Sendable {
+    nonisolated enum Kind: Sendable {
+        case sps        // Sequence parameter set (type 7)
+        case pps        // Picture parameter set (type 8)
+        case idr        // Keyframe (type 5)
+        case nonIDR     // P/B frame (type 1)
+        case other(UInt8)
+    }
+    let kind: Kind
+    let bytes: Data            // RAW NAL — no start code, no length prefix
+    let timestamp: CMTime
+    let isKeyframe: Bool
+
+    var nalType: UInt8 {
+        bytes.first.map { $0 & 0x1F } ?? 0
+    }
+}
+
+final class H264Encoder {
+
+    let width: Int32
+    let height: Int32
+    let fps: Int32
+    let bitrate: Int32  // bits / second
+    let keyframeInterval: Int32
+
+    /// Set by the owner before `start()`. Called on the encoder's
+    /// callback thread for every emitted NAL.
+    var onNAL: ((EncodedNAL) -> Void)?
+
+    private let log = Logger(subsystem: "eu.kolaczek.tripperdashpp", category: "H264")
+    private var session: VTCompressionSession?
+    private var lastFormatDescription: CMFormatDescription?
+    /// Set when the next emitted frame must be an IDR. Used after a
+    /// session rebuild so the depacketizer can resynchronise without
+    /// waiting for the regular keyframe cadence.
+    private var pendingForceKeyframe = false
+    /// Throttle for noisy `VTCompressionSessionEncodeFrame` errors —
+    /// when iOS suspends the app the encoder fails at the frame rate until we
+    /// rebuild the session, and we don't want to spam the log file.
+    private var consecutiveEncodeErrors = 0
+
+    init(
+        width: Int32 = 526,
+        height: Int32 = 300,
+        fps: Int32 = 4,
+        bitrate: Int32 = 512_000,
+        keyframeInterval: Int32? = nil   // nil = fps → one IDR per second
+    ) {
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.bitrate = bitrate
+        self.keyframeInterval = keyframeInterval ?? fps
+    }
+
+    deinit { stop() }
+
+    // MARK: - Lifecycle
+
+    func start() throws {
+        guard session == nil else { return }
+        try createSession()
+    }
+
+    func stop() {
+        guard let session else { return }
+        VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+        VTCompressionSessionInvalidate(session)
+        self.session = nil
+        lastFormatDescription = nil
+        pendingForceKeyframe = false
+        consecutiveEncodeErrors = 0
+        log.info("H264Encoder stopped")
+    }
+
+    func forceKeyframeNext() {
+        pendingForceKeyframe = true
+    }
+
+    // MARK: - Session (re)creation
+
+    private func createSession() throws {
+        var s: VTCompressionSession?
+        let status = VTCompressionSessionCreate(
+            allocator: nil,
+            width: width,
+            height: height,
+            codecType: kCMVideoCodecType_H264,
+            encoderSpecification: nil,
+            imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: nil,
+            refcon: nil,
+            compressionSessionOut: &s
+        )
+        guard status == noErr, let session = s else {
+            throw EncoderError.sessionCreateFailed(status)
+        }
+        self.session = session
+
+        // Property bag — baseline profile, low latency, fixed bitrate.
+        let props: [(CFString, CFTypeRef)] = [
+            (kVTCompressionPropertyKey_RealTime, kCFBooleanTrue),
+            (kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse),
+            (kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel),
+            (kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: bitrate)),
+            (kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: fps)),
+            (kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: keyframeInterval)),
+            (kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: Double(keyframeInterval) / Double(fps))),
+            // Data-rate limit: no more than one second's average worth of
+            // bytes in any 1 s window — no burst headroom, like the stock
+            // app (better-dash: `-maxrate` = `-b:v`). It used to allow 3×
+            // the average so a heavy frame (route line + text) got through
+            // unclipped at 1.2 Mbps, but a burst is exactly what the dash's
+            // small jitter buffer and the Wi-Fi link drop packets on. At the
+            // lower bitrate a heavy frame now gets coarser instead.
+            (kVTCompressionPropertyKey_DataRateLimits, [NSNumber(value: bitrate / 8), NSNumber(value: 1)] as CFArray),
+        ]
+        for (key, value) in props {
+            let s = VTSessionSetProperty(session, key: key, value: value)
+            if s != noErr {
+                log.warning("VTSessionSetProperty \(key as String) failed: \(s)")
+            }
+        }
+        VTCompressionSessionPrepareToEncodeFrames(session)
+        // The format description rotates with the rebuilt session, so
+        // force the next coded slice to be an IDR + re-emit SPS/PPS.
+        lastFormatDescription = nil
+        pendingForceKeyframe = true
+        log.info("H264Encoder session ready \(self.width)x\(self.height) @ \(self.fps)fps, \(self.bitrate / 1000) kbps")
+    }
+
+    /// Tear the current VT session down and build a fresh one. Called
+    /// when `VTCompressionSessionEncodeFrame` returns
+    /// `kVTInvalidSessionErr` (-12903), which happens any time iOS
+    /// briefly suspends the app and reclaims GPU access — most commonly
+    /// when the screen locks while streaming. The session itself is
+    /// unrecoverable; only a rebuild restores hardware encoding.
+    private func rebuildSession() {
+        if let s = session {
+            VTCompressionSessionInvalidate(s)
+            self.session = nil
+        }
+        do {
+            try createSession()
+            log.notice("H264Encoder session rebuilt after invalidation")
+        } catch {
+            log.error("H264Encoder session rebuild failed: \(String(describing: error))")
+        }
+    }
+
+    // MARK: - Encode
+
+    func encode(pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
+        guard let session else { return }
+        // The first frame after a session rebuild MUST be an IDR so the
+        // dash can resync — same flag is set by createSession() for the
+        // initial frame.
+        var frameProperties: [CFString: Any] = [:]
+        if pendingForceKeyframe {
+            frameProperties[kVTEncodeFrameOptionKey_ForceKeyFrame] = kCFBooleanTrue
+            pendingForceKeyframe = false
+        }
+        var infoFlags = VTEncodeInfoFlags()
+        let status = VTCompressionSessionEncodeFrame(
+            session,
+            imageBuffer: pixelBuffer,
+            presentationTimeStamp: presentationTime,
+            duration: CMTime(value: 1, timescale: fps),
+            frameProperties: frameProperties as CFDictionary,
+            infoFlagsOut: &infoFlags
+        ) { [weak self] status, _, sampleBuffer in
+            self?.handleEncoded(status: status, sampleBuffer: sampleBuffer)
+        }
+        if status != noErr {
+            consecutiveEncodeErrors += 1
+            // -12903 kVTInvalidSessionErr — most common cause: app got
+            // suspended (screen lock) and lost GPU access. Rebuild the
+            // session once; subsequent frames will succeed.
+            // -12902 kVTSessionMalfunctionErr — same recovery path.
+            if status == -12903 || status == -12902 {
+                if consecutiveEncodeErrors == 1 {
+                    log.notice("VTCompressionSessionEncodeFrame failed: \(status) — rebuilding session")
+                }
+                rebuildSession()
+            } else if consecutiveEncodeErrors == 1 {
+                log.error("VTCompressionSessionEncodeFrame failed: \(status)")
+            }
+        } else {
+            consecutiveEncodeErrors = 0
+        }
+    }
+
+    // MARK: - Callback
+
+    private func handleEncoded(status: OSStatus, sampleBuffer: CMSampleBuffer?) {
+        guard status == noErr, let sampleBuffer, CMSampleBufferDataIsReady(sampleBuffer) else {
+            return
+        }
+
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
+            as? [[CFString: Any]]
+        let isKey: Bool
+        if let first = attachments?.first,
+           let notSync = first[kCMSampleAttachmentKey_NotSync] as? Bool {
+            isKey = !notSync
+        } else {
+            isKey = true
+        }
+
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+        // On keyframes, extract SPS+PPS from the format description and
+        // emit them BEFORE the IDR so the depacketizer can build a decoder.
+        if isKey,
+           let fmt = CMSampleBufferGetFormatDescription(sampleBuffer) {
+            if !areFormatDescriptionsEqual(fmt, lastFormatDescription) {
+                emitParameterSets(from: fmt, at: pts)
+                lastFormatDescription = fmt
+            } else {
+                // Same SPS/PPS, but still re-send on every IDR so a late
+                // joiner can pick up the stream without waiting for an
+                // encoder restart.
+                emitParameterSets(from: fmt, at: pts)
+            }
+        }
+
+        // The compressed sample buffer holds NALs in AVCC format — each
+        // NAL prefixed by a 4-byte big-endian length. Split into raw NALs.
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        var length = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+        let bbStatus = CMBlockBufferGetDataPointer(
+            blockBuffer,
+            atOffset: 0,
+            lengthAtOffsetOut: nil,
+            totalLengthOut: &length,
+            dataPointerOut: &dataPointer
+        )
+        guard bbStatus == kCMBlockBufferNoErr, let dataPointer else { return }
+
+        let base = UnsafeRawPointer(dataPointer).assumingMemoryBound(to: UInt8.self)
+        var offset = 0
+        while offset + 4 < length {
+            let nalLength = Int(UInt32(base[offset]) << 24 |
+                                UInt32(base[offset + 1]) << 16 |
+                                UInt32(base[offset + 2]) << 8 |
+                                UInt32(base[offset + 3]))
+            offset += 4
+            guard nalLength > 0, offset + nalLength <= length else { break }
+            let bytes = Data(bytes: base.advanced(by: offset), count: nalLength)
+            offset += nalLength
+
+            let nalType = bytes.first.map { $0 & 0x1F } ?? 0
+            let kind: EncodedNAL.Kind
+            switch nalType {
+            case 5: kind = .idr
+            case 1: kind = .nonIDR
+            case 7: kind = .sps
+            case 8: kind = .pps
+            default: kind = .other(nalType)
+            }
+            onNAL?(EncodedNAL(kind: kind, bytes: bytes, timestamp: pts, isKeyframe: isKey))
+        }
+    }
+
+    private func emitParameterSets(from fmt: CMFormatDescription, at pts: CMTime) {
+        var spsCount = 0
+        let _ = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            fmt, parameterSetIndex: 0,
+            parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+            parameterSetCountOut: &spsCount, nalUnitHeaderLengthOut: nil
+        )
+        for i in 0..<spsCount {
+            var ptr: UnsafePointer<UInt8>?
+            var size = 0
+            let s = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                fmt, parameterSetIndex: i,
+                parameterSetPointerOut: &ptr, parameterSetSizeOut: &size,
+                parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
+            )
+            guard s == noErr, let ptr else { continue }
+            let bytes = Data(bytes: ptr, count: size)
+            let nalType = bytes.first.map { $0 & 0x1F } ?? 0
+            let kind: EncodedNAL.Kind = (nalType == 7) ? .sps : (nalType == 8) ? .pps : .other(nalType)
+            onNAL?(EncodedNAL(kind: kind, bytes: bytes, timestamp: pts, isKeyframe: true))
+        }
+    }
+
+    private func areFormatDescriptionsEqual(_ a: CMFormatDescription?, _ b: CMFormatDescription?) -> Bool {
+        guard let a, let b else { return false }
+        return CMFormatDescriptionEqual(a, otherFormatDescription: b)
+    }
+
+    enum EncoderError: Error {
+        case sessionCreateFailed(OSStatus)
+    }
+}

@@ -1,0 +1,76 @@
+name: iOS build
+
+# Build + unit-test sanity check on every push. The app is a
+# UIKit/MapKit/VideoToolbox iOS target, so it must build on a macOS runner
+# with Xcode — it cannot be built on Linux. No code signing (simulator).
+#
+# The pure ride-logic (weather-along-route sampling/classification,
+# distance formatting) is covered by the TripperDashPPTests unit-test
+# target (Swift Testing). Unit tests need a CONCRETE simulator destination
+# (a generic destination builds but cannot `test`), so we resolve one
+# booted iPhone runtime and run `xcodebuild test` against it.
+#
+# Only `push` is wired up (not `pull_request`): a push run's check is
+# attached to the head commit, so it already surfaces on any PR for that
+# commit — adding a pull_request trigger would just double-run the same
+# SHA and burn macOS minutes.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: xcodebuild test (iOS Simulator)
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    env:
+      PROJECT: TripperDashPP/TripperDashPP.xcodeproj
+      SCHEME: TripperDashPP
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Select latest stable Xcode
+        run: |
+          # Exclude betas / release candidates, which the runner image may
+          # also carry and which `sort -V` would otherwise rank highest.
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | grep -viE 'beta|release_candidate|_rc' | sort -V | tail -1)/Contents/Developer"
+          xcodebuild -version
+          swift --version
+
+      - name: Resolve a concrete iOS Simulator destination
+        id: dest
+        run: |
+          # `xcodebuild test` (unlike `build`) needs a CONCRETE destination,
+          # not `generic/platform=iOS Simulator`. Pick the newest available
+          # iPhone simulator by id so we don't pin a name the runner image
+          # might drop.
+          UDID=$(xcrun simctl list devices available -j \
+            | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; \
+                 devs=[x for r in d.values() for x in r if 'iPhone' in x['name']]; \
+                 print(devs[-1]['udid'] if devs else '')")
+          if [ -z "$UDID" ]; then echo "No iPhone simulator available" >&2; exit 1; fi
+          echo "Using simulator $UDID"
+          echo "destination=platform=iOS Simulator,id=$UDID" >> "$GITHUB_OUTPUT"
+
+      - name: Build & test
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -destination "${{ steps.dest.outputs.destination }}" \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""

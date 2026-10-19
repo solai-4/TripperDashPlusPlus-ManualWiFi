@@ -1,0 +1,461 @@
+//
+//  StreamingView.swift
+//  TripperDashPP
+//
+//  Settings surface. The actual stream lifecycle is driven from
+//  MapPickerView: starting navigation (or a free ride) also starts the RTP
+//  pipeline (MapViewSource → H264Encoder → RtpPacketizer), and ending it
+//  tears it down. This view is settings only — manage bikes, pick units /
+//  voice / alerts / map style, clear caches, read the build.
+//
+
+import CoreLocation
+import OSLog
+import SwiftUI
+
+struct StreamingView: View {
+    @Environment(AppStatus.self) private var status
+    @Environment(\.dismiss) private var dismiss
+
+    /// Presents the "add bike" form sheet.
+    @State private var showAddBike = false
+
+    /// The bike whose name the edit sheet is changing (swipe → Edit).
+    @State private var editingBike: SavedBike?
+
+    /// Presents the permissions checklist sheet.
+    @State private var showPermissions = false
+
+    /// Allow connecting/editing the garage only when we're not actively
+    /// connected or mid-handshake. Idle and error states are both safe
+    /// entry points for (re)connecting.
+    private var isEditableState: Bool {
+        switch status.bikeLink.state {
+        case .idle, .error: return true
+        case .connecting, .handshaking, .reconnecting, .connected: return false
+        }
+    }
+
+    /// One bike in the garage list: the rider's name on top, its Wi-Fi SSID
+    /// as a monospaced subtitle, a Connect button on the trail. Connect is
+    /// disabled while demo mode is on (nothing to connect to) or the link
+    /// is busy.
+    @ViewBuilder
+    private func bikeRow(_ bike: SavedBike) -> some View {
+        HStack {
+            Image(systemName: "bicycle")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(bike.displayName)
+                Text(bike.ssid)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Connect") {
+                status.connect(to: bike)
+                dismiss()
+            }
+            .buttonStyle(.borderless)
+            .disabled(status.bikeLink.demoMode || !isEditableState)
+        }
+    }
+
+    /// The "add a bike" row: a button that opens a short form sheet where the
+    /// rider names the bike and enters its Wi-Fi SSID.
+    @ViewBuilder
+    private var addBikeRow: some View {
+        Button {
+            showAddBike = true
+        } label: {
+            Label("Add bike", systemImage: "plus.circle.fill")
+        }
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                if status.savedBikes.bikes.isEmpty {
+                    Text("No bikes yet. Add your Tripper's Wi-Fi network below (RE_XXXX_XXXXXX).")
+                        .foregroundStyle(.secondary)
+                        .font(.footnote)
+                } else {
+                    ForEach(status.savedBikes.bikes) { bike in
+                        bikeRow(bike)
+                            .swipeActions {
+                                // Deleting drops the iOS Wi-Fi config too —
+                                // not while the link is using it. Renaming
+                                // is a label only, so it's always offered.
+                                if isEditableState {
+                                    Button("Delete", role: .destructive) {
+                                        status.removeBike(id: bike.id)
+                                    }
+                                }
+                                Button("Edit") { editingBike = bike }
+                                    .tint(.blue)
+                            }
+                    }
+                }
+                addBikeRow
+
+                Toggle("Demo mode", isOn: Binding(
+                    get: { status.bikeLink.demoMode },
+                    set: { status.bikeLink.demoMode = $0 }
+                ))
+                .disabled(!isEditableState)
+            } header: {
+                Text("Bikes")
+            } footer: {
+                Text("Demo mode simulates the dash on-screen without the bike — for trying the app without hardware. Everything else (GPS, routing, voice) stays real; nothing is sent over Wi-Fi.")
+            }
+
+            Section("Dash display") {
+                Picker("Units", selection: Binding(
+                    get: { status.dashNavSettings.units },
+                    set: { status.dashNavSettings.units = $0 }
+                )) {
+                    ForEach(DashNavSettings.UnitSystem.allCases) { u in
+                        Text(u.label).tag(u)
+                    }
+                }
+                Picker("Decimal separator", selection: Binding(
+                    get: { status.dashNavSettings.decimalSeparator },
+                    set: { status.dashNavSettings.decimalSeparator = $0 }
+                )) {
+                    ForEach(DashNavSettings.DecimalSeparator.allCases) { d in
+                        Text(d.label).tag(d)
+                    }
+                }
+                Picker("Clock", selection: Binding(
+                    get: { status.dashNavSettings.clockFormat },
+                    set: { status.dashNavSettings.clockFormat = $0 }
+                )) {
+                    ForEach(DashNavSettings.ClockFormat.allCases) { c in
+                        Text(c.label).tag(c)
+                    }
+                }
+            }
+
+            Section("Voice guidance") {
+                Toggle(isOn: Binding(
+                    get: { status.dashNavSettings.voiceEnabled },
+                    set: {
+                        status.dashNavSettings.voiceEnabled = $0
+                        // Keep the synth's cheap gate in lock-step so a
+                        // just-toggled-off setting silences the next prompt
+                        // immediately, and toggling off mid-ride stops any
+                        // sentence in flight.
+                        status.voiceNavigator.enabled = $0
+                        if !$0 { status.voiceNavigator.stop() }
+                    }
+                )) {
+                    Text("Spoken turn-by-turn")
+                }
+
+                if status.dashNavSettings.voiceEnabled {
+                    Picker("Language", selection: Binding(
+                        get: { status.dashNavSettings.voiceLanguage },
+                        set: { status.dashNavSettings.voiceLanguage = $0 }
+                    )) {
+                        ForEach(VoiceLanguage.allCases) { l in
+                            Text(l.label).tag(l)
+                        }
+                    }
+
+                    Toggle(isOn: Binding(
+                        get: { status.dashNavSettings.voiceSpeedCameraEnabled },
+                        set: { status.dashNavSettings.voiceSpeedCameraEnabled = $0 }
+                    )) {
+                        Text("Speak speed-camera alerts")
+                    }
+                }
+            }
+
+            Section("Notifications") {
+                Toggle(isOn: Binding(
+                    get: { status.dashNavSettings.callStateEnabled },
+                    set: { status.dashNavSettings.callStateEnabled = $0 }
+                )) {
+                    Text("Incoming call")
+                }
+
+                Toggle(isOn: Binding(
+                    get: { status.dashNavSettings.weatherAlertsEnabled },
+                    set: { status.dashNavSettings.weatherAlertsEnabled = $0 }
+                )) {
+                    Text("Weather alerts")
+                }
+
+                Toggle(isOn: Binding(
+                    get: { status.dashNavSettings.speedCamerasEnabled },
+                    set: { status.dashNavSettings.speedCamerasEnabled = $0 }
+                )) {
+                    Text("Speed cameras")
+                }
+
+                Picker("Speed limit", selection: Binding(
+                    get: { status.dashNavSettings.speedLimitDisplay },
+                    set: { status.dashNavSettings.speedLimitDisplay = $0 }
+                )) {
+                    ForEach(DashNavSettings.SpeedLimitDisplay.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                if status.dashNavSettings.speedLimitDisplay == .overOnly {
+                    Stepper(
+                        "Speeding tolerance: +\(status.dashNavSettings.speedLimitOverToleranceDisplay) \(status.dashNavSettings.speedLimitToleranceUnit)",
+                        value: Binding(
+                            get: { status.dashNavSettings.speedLimitOverToleranceDisplay },
+                            set: { status.dashNavSettings.speedLimitOverToleranceDisplay = $0 }
+                        ),
+                        in: 0...20
+                    )
+                }
+                Text("Shows the posted limit as a road sign in the bottom-right corner. From OpenStreetMap data — coverage varies and untagged roads show nothing, so treat a missing sign as unknown, not zero.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Live traffic") {
+                Toggle(isOn: Binding(
+                    get: { status.dashNavSettings.trafficRerouteEnabled },
+                    set: { status.dashNavSettings.trafficRerouteEnabled = $0 }
+                )) {
+                    Text("Auto-reroute around traffic")
+                }
+                if status.dashNavSettings.trafficRerouteEnabled {
+                    Stepper(
+                        "Only if it saves ≥ \(status.dashNavSettings.trafficRerouteSavingMinutes) min",
+                        value: Binding(
+                            get: { status.dashNavSettings.trafficRerouteSavingMinutes },
+                            set: { status.dashNavSettings.trafficRerouteSavingMinutes = $0 }
+                        ),
+                        in: 1...30
+                    )
+                }
+            }
+
+            // Route preferences live ONLY in the planning panel's
+            // sliders button now (feat/route-waypoints). Removed from
+            // here so there's a single source of truth the user edits.
+
+            Section("Map") {
+                Picker("Appearance", selection: Binding(
+                    get: { status.mapStyleSettings.mode },
+                    set: { status.setMapStyleMode($0) }
+                )) {
+                    ForEach(MapStyleSettings.Mode.allCases) { m in
+                        Text(m.label).tag(m)
+                    }
+                }
+                if status.mapStyleSettings.mode == .auto {
+                    LabeledContent("Currently",
+                                   value: status.effectiveMapStyle == .dark ? "Dark" : "Light")
+                }
+                Toggle(isOn: Binding(
+                    get: { status.dashNavSettings.progressBarEnabled },
+                    set: { status.dashNavSettings.progressBarEnabled = $0 }
+                )) {
+                    Text("Route progress bar")
+                }
+                Text("Auto follows local sunrise and sunset from your GPS position.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            MapCacheSection()
+
+            // Debug builds only (Xcode Run → Debug; Archive, so TestFlight
+            // and the App Store, → Release): the log carries GPS positions.
+            #if DEBUG
+            LogExportSection()
+            #endif
+
+            Section("About") {
+                // "1.0.3 (6) · abc1234": marketing version, CFBundleVersion
+                // build number in parentheses (what TestFlight shows), then
+                // the short git commit SHA stamped by tools/stamp-git-sha.sh.
+                LabeledContent("Version", value: "\(status.buildVersion) (\(status.buildNumber)) · \(status.buildCommitSHA)")
+                Link(destination: URL(string: "https://github.com/kolaCZek/TripperDashPlusPlus/issues/new")!) {
+                    Label("Report a bug", systemImage: "ladybug")
+                }
+                Button {
+                    showPermissions = true
+                } label: {
+                    Label("Check permissions", systemImage: "checkmark.shield")
+                }
+            }
+        }
+        .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showPermissions) {
+            PermissionsView()
+        }
+        .sheet(isPresented: $showAddBike) {
+            AddBikeSheet { name, ssid in
+                status.addBike(name: name, ssid: ssid)
+            }
+        }
+        .sheet(item: $editingBike) { bike in
+            AddBikeSheet(editing: bike) { name, _ in
+                status.savedBikes.rename(id: bike.id, to: name)
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("Done") { dismiss() }
+            }
+        }
+    }
+}
+
+/// Settings cell that shows the total on-disk cache footprint (map tiles
+/// + speed-limit + speed-camera data) and offers a single "Clear cache"
+/// button that wipes all three. Kept as its own `View` (not inlined) so
+/// the `@State` for the stats stays scoped — the parent Form re-renders
+/// constantly when other settings change and we don't want every
+/// keystroke to trigger another disk walk.
+private struct MapCacheSection: View {
+    @State private var stats: (count: Int, bytes: Int) = (0, 0)
+    @State private var isClearing = false
+
+    var body: some View {
+        Section("Cache") {
+            // One row for the whole on-disk footprint: OSM tiles plus the
+            // RideAlerts JSON caches (speed limits + cameras). They all
+            // live under Caches/ and are all safe to drop — the app just
+            // re-fetches on the next ride.
+            LabeledContent("Cached data") {
+                statsView(stats)
+            }
+            Button(role: .destructive) {
+                Task {
+                    isClearing = true
+                    // Clear all three caches. Map tiles are the bulk;
+                    // clearing the speed-limit cache is also what fixes a
+                    // stale pre-shadow-guard entry still showing a phantom
+                    // limit (e.g. a 90 on a 50 street).
+                    await TileDiskCache.shared.clearAll()
+                    await SpeedLimitService.shared.clearDiskCache()
+                    await SpeedCameraService.shared.clearDiskCache()
+                    await refresh()
+                    isClearing = false
+                }
+            } label: {
+                Label("Clear cache", systemImage: "trash")
+            }
+            .disabled(isClearing || stats.bytes == 0)
+        }
+        .task {
+            // First appearance: load real numbers. Cheap walk (~few
+            // hundred files at most), no need for a background queue.
+            await refresh()
+        }
+    }
+
+    @ViewBuilder
+    private func statsView(_ s: (count: Int, bytes: Int)) -> some View {
+        if isClearing {
+            ProgressView()
+        } else {
+            Text(formatStats(s))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+    }
+
+    private func refresh() async {
+        // Sum all three on-disk caches so the row reflects the true
+        // footprint and the button enables whenever ANY cache has data
+        // (not just map tiles).
+        let tiles = await TileDiskCache.shared.statsAll()
+        let limits = await SpeedLimitService.shared.diskCacheStats()
+        let cameras = await SpeedCameraService.shared.diskCacheStats()
+        stats = (count: tiles.count + limits.count + cameras.count,
+                 bytes: tiles.bytes + limits.bytes + cameras.bytes)
+    }
+
+    /// Built once, not per render (main-actor-isolated like the view).
+    private static let byteFormatter: ByteCountFormatter = {
+        let fmt = ByteCountFormatter()
+        fmt.allowedUnits = [.useKB, .useMB]
+        fmt.countStyle = .file
+        return fmt
+    }()
+
+    private func formatStats(_ s: (count: Int, bytes: Int)) -> String {
+        if s.count == 0 { return "Empty" }
+        let files = s.count == 1 ? "1 file" : "\(s.count) files"
+        return "\(files) • \(Self.byteFormatter.string(fromByteCount: Int64(s.bytes)))"
+    }
+}
+
+#if DEBUG
+/// "Export log" (Debug builds only): the app's own log lines (every subsystem containing
+/// `kolaczek`, info level and up) since this launch, as a text file for
+/// the share sheet — so a rider can send a field log without a Mac.
+/// iOS only lets an app read its current process's entries, so this must
+/// be done before the app is quit or killed. `OSLogPreferences` in
+/// Info.plist persists the info level, so a long ride isn't rolled out of
+/// the memory buffer.
+private struct LogExportSection: View {
+    @State private var exportURL: URL?
+    @State private var isPreparing = false
+    @State private var failed = false
+
+    var body: some View {
+        Section {
+            if let url = exportURL {
+                ShareLink(item: url) {
+                    Label("Share log", systemImage: "square.and.arrow.up")
+                }
+            } else {
+                Button {
+                    Task {
+                        isPreparing = true
+                        exportURL = await Self.writeLog()
+                        failed = exportURL == nil
+                        isPreparing = false
+                    }
+                } label: {
+                    Label("Export log", systemImage: "doc.text")
+                }
+                .disabled(isPreparing)
+            }
+        } header: {
+            Text("Diagnostics")
+        } footer: {
+            Text(failed
+                 ? "Couldn't read the log."
+                 : "Everything the app logged since it was last launched, including GPS positions. Export it before you close the app.")
+        }
+    }
+
+    /// Reads and formats off main: a ride's worth of entries takes a while.
+    @concurrent nonisolated private static func writeLog() async -> URL? {
+        do {
+            let store = try OSLogStore(scope: .currentProcessIdentifier)
+            let own = NSPredicate(format: "subsystem CONTAINS %@", "kolaczek")
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.dateFormat = "HH:mm:ss.SSS"
+            var text = ""
+            for case let entry as OSLogEntryLog in try store.getEntries(matching: own) {
+                text += "\(fmt.string(from: entry.date)) [\(entry.category)] \(entry.composedMessage)\n"
+            }
+            fmt.dateFormat = "yyyy-MM-dd-HHmm"
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("TripperDashPP-log-\(fmt.string(from: Date())).txt")
+            try Data(text.utf8).write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
+    }
+}
+#endif
+
+#Preview {
+    NavigationStack { StreamingView() }
+        .environment(AppStatus())
+}

@@ -1,0 +1,350 @@
+//
+//  NavigationHUD.swift
+//  TripperDashPP
+//
+//  Phase 7f — full-screen HUD shown during active navigation. Replaces
+//  the live MKMapView (we're navigating → mutually exclusive with
+//  picker live map → no GPU pool race).
+//
+//  Shows:
+//    - Next maneuver card (icon + instruction + distance)
+//    - ETA strip (arrival time, time remaining, distance remaining)
+//    - Rerouting indicator when active
+//    - Reconnecting banner when the dash link dropped mid-ride
+//    - "You've arrived" card on final-destination arrival
+//
+//  The Stop button lives in MapPickerView's bottom control bar (single
+//  source of truth), NOT here — this HUD is purely informational.
+//
+
+import MapKit
+import SwiftUI
+
+struct NavigationHUD: View {
+
+    @Environment(ActiveNavigator.self) private var nav
+
+    /// True while the dash link dropped and BikeLink is auto-reconnecting.
+    /// Fed from MapPickerView (which can see `bikeLink.state`); the HUD
+    /// only has the navigator in its environment.
+    var isReconnecting: Bool = false
+
+    /// True when those reconnect attempts are reaching the dash but getting
+    /// no K1G reply — see `BikeLink.dashUnresponsive`. Fed the same way as
+    /// `isReconnecting`. Defaults to false so the banner reads as an ordinary
+    /// reconnect for any call site that doesn't wire it up.
+    var dashUnresponsive: Bool = false
+
+    /// Rider display preferences, injected from MapPickerView (the HUD only
+    /// has the navigator in its environment). Default to metric / 24-hour so
+    /// previews and any un-wired call sites still compile and read sanely.
+    var imperial: Bool = false
+    var useCommaDecimal: Bool = false
+    var is24Hour: Bool = true
+
+    /// Opens the mid-ride route editor (MapPickerView owns the sheet). nil
+    /// hides the button.
+    var onEditRoute: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(spacing: 16) {
+            if isReconnecting { reconnectBanner }
+            if nav.hasArrived {
+                arrivedCard
+            } else {
+                maneuverCard
+                if showsStopPills(nav.plan) {
+                    stopProgressPill(plan: nav.plan!)
+                }
+                etaCard
+                if showsStopPills(nav.plan) {
+                    finalEtaPill
+                }
+                routeOverview
+                if let onEditRoute, nav.plan?.isEditableMidRide == true {
+                    Button(action: onEditRoute) {
+                        Label("Edit route", systemImage: "list.bullet")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                }
+            }
+            Spacer()
+        }
+        .padding()
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+
+    // MARK: - Subviews
+
+    /// Whether to show the multi-stop pills (per-leg "Stop X of Y · next …"
+    /// and the separate final-ETA pill). Only for a genuine multi-STOP plan
+    /// the rider built by hand (`legs.count > 1` AND not a track). A track
+    /// route's intermediate waypoints are shape, not stops, so it reads as
+    /// a single start→finish leg with no per-stop chrome.
+    private func showsStopPills(_ plan: PlannedRoute?) -> Bool {
+        guard let plan else { return false }
+        return plan.legs.count > 1 && !plan.isTrack
+    }
+
+    /// True when the ETA card should be scoped to the FINAL destination
+    /// rather than the current leg: single-destination plans (leg IS the
+    /// destination) and track plans (via-points are pass-through). Only a
+    /// hand-built multi-stop plan scopes the card to the next stop.
+    private var etaScopedToFinal: Bool {
+        guard let plan = nav.plan else { return true }
+        return plan.isTrack || plan.legs.count <= 1
+    }
+
+    /// Shown when BikeLink is auto-reconnecting after a mid-ride drop.
+    /// The dash is dark during the drop, so this is the rider's only
+    /// signal that the app is working to bring nav back.
+    private var reconnectBanner: some View {
+        HStack(spacing: 8) {
+            ProgressView().controlSize(.small)
+            // See BikeLink.dashUnresponsive: a wedged dash needs an
+            // ignition cycle, so saying "Reconnecting…" forever is
+            // actively misleading.
+            Text(dashUnresponsive
+                 ? "Dash not responding — try the ignition"
+                 : "Reconnecting to dash…")
+                .font(.subheadline.weight(.semibold))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(.yellow.opacity(0.18), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    /// Final-destination arrival confirmation. Shown for a few seconds
+    /// before MapPickerView auto-dismisses back to the picker.
+    private var arrivedCard: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "flag.checkered.circle.fill")
+                .font(.system(size: 40, weight: .semibold))
+                .foregroundStyle(.green)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("You've arrived")
+                    .font(.title2.weight(.semibold))
+                Text(nav.destination?.name ?? "Destination")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(.green.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    /// Multi-stop progress: "Stop 2 of 3 · next Slaný". Only shown when
+    /// the active session is plan-navigating more than one leg.
+    private func stopProgressPill(plan: PlannedRoute) -> some View {
+        let total = plan.legs.count
+        let current = min(nav.currentLegIndex + 1, total)
+        let nextWaypointName: String = {
+            let leg = plan.legs.indices.contains(nav.currentLegIndex) ? plan.legs[nav.currentLegIndex] : nil
+            if let leg, let wp = plan.waypoint(id: leg.toWaypointId) { return wp.name }
+            return "—"
+        }()
+        return HStack(spacing: 8) {
+            Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                .foregroundStyle(.blue)
+            Text("Stop \(current) of \(total)")
+                .font(.subheadline.weight(.semibold))
+            Text("· next \(nextWaypointName)")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var maneuverCard: some View {
+        HStack(alignment: .center, spacing: 14) {
+            ZStack {
+                Circle().fill(.blue.opacity(0.15)).frame(width: 60, height: 60)
+                Image(systemName: upcomingManeuverSymbol)
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(.blue)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(distanceToNext)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.primary)
+                Text(nav.upcomingInstructions ?? "Continue")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(.background, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(alignment: .topTrailing) {
+            if nav.isOffRoute {
+                Label(nav.isRerouting ? "Rerouting…" : "Off route", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(.orange.opacity(0.2), in: Capsule())
+                    .foregroundStyle(.orange)
+                    .padding(6)
+            }
+        }
+    }
+
+    /// F6: wrapped in a 1 Hz `TimelineView` because `etaSeconds` /
+    /// `finalDestinationEtaSeconds` are now computed against `Date.now`
+    /// from a `legArrivalDate` that only CHANGES on a GPS fix landing,
+    /// a periodic Apple re-fetch, or seed/reroute/leg-advance — NOT
+    /// every second. SwiftUI's `@Observable` tracking only re-renders a
+    /// view when a tracked property it read actually changes value, so
+    /// without this the countdown would visually freeze between those
+    /// events (most noticeably while stopped, when GPS fixes can thin
+    /// out or stop under `LocationService`'s `distanceFilter`). The
+    /// dash doesn't have this problem — `ActiveNavLoop`'s own 1 Hz
+    /// `Task` re-reads the computed property directly every second with
+    /// no Observation dependency — so this keeps the phone HUD's
+    /// countdown just as smooth as the dash's.
+    private var etaCard: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            HStack(spacing: 0) {
+                etaSlot(title: "ETA", value: arrivalTime, icon: "flag.checkered")
+                Divider().frame(height: 32)
+                etaSlot(title: "Remaining", value: timeRemaining, icon: "clock")
+                Divider().frame(height: 32)
+                etaSlot(title: "Distance", value: distanceRemaining, icon: "ruler")
+            }
+            .padding(12)
+            .background(.background, in: RoundedRectangle(cornerRadius: 14))
+        }
+    }
+
+    private func etaSlot(title: String, value: String, icon: String) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon).foregroundStyle(.secondary)
+            Text(value).font(.headline.monospacedDigit())
+            Text(title).font(.caption2).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    /// Final-destination ETA — distinct from `etaCard`'s "ETA" slot,
+    /// which is scoped to the CURRENT LEG (next stop). Only shown for a
+    /// genuine multi-stop plan (`showsStopPills`: `legs.count > 1` and not
+    /// a track, same gate as `stopProgressPill`); for a single-destination
+    /// route the leg IS the destination, so a second identical number would just be
+    /// clutter. This is the one field the dash does NOT get a matching
+    /// per-leg counterpart for — the bike only ever shows this
+    /// whole-trip arrival, not the per-leg one (see `ActiveNavLoop.tick()`).
+    /// See `etaCard`'s doc-comment for why this needs the same 1 Hz
+    /// `TimelineView` wrapper (F6: `finalDestinationEtaSeconds` is
+    /// computed against `Date.now` too, via the same `legArrivalDate`).
+    private var finalEtaPill: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            HStack(spacing: 8) {
+                Image(systemName: "flag.checkered.circle.fill")
+                    .foregroundStyle(.green)
+                Text("Final ETA \(finalArrivalTime)")
+                    .font(.subheadline.weight(.semibold))
+                Text("· \(finalTimeRemaining) left")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(.green.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    /// Static "progress bar" overview of the whole planned route: the
+    /// travelled trace (grey) + the route ahead (blue) + a position puck,
+    /// reusing the same snapshot recipe as the editor's saved-route
+    /// thumbnail. Lives in the otherwise-empty space below the ETA card.
+    /// Only shown once there's geometry to draw (avoids an empty grey box
+    /// in the beat before the first fix / route lands).
+    @ViewBuilder
+    private var routeOverview: some View {
+        if !nav.routeAheadCoordinates.isEmpty || !nav.traveledCoordinates.isEmpty {
+            RouteProgressMap(
+                traveled: nav.traveledCoordinates,
+                ahead: nav.routeAheadCoordinates,
+                position: nav.currentCoordinate
+            )
+            .frame(height: 150)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(.quaternary, lineWidth: 0.5)
+            )
+        }
+    }
+
+    // MARK: - Display helpers
+
+    /// Rounded exactly like the dash's turn card, so phone and dash agree.
+    private var distanceToNext: String {
+        DashNavSettings.maneuverDistanceText(meters: nav.distanceToNextStep,
+                                             imperial: imperial,
+                                             useCommaDecimal: useCommaDecimal)
+    }
+
+    /// Same units as the dash's distance TLVs: feet only below 160 m.
+    private var distanceRemaining: String {
+        let m = etaScopedToFinal ? nav.finalDestinationRemainingDistance : nav.remainingDistance
+        return DashNavSettings.wireDistanceText(meters: m, imperial: imperial,
+                                                useCommaDecimal: useCommaDecimal)
+    }
+
+    /// Seconds the ETA card should display: final-destination ETA when the
+    /// card is final-scoped (single-destination + track), else the current
+    /// leg's ETA (hand-built multi-stop → counts down to the next stop).
+    private var etaCardSeconds: TimeInterval {
+        etaScopedToFinal ? nav.finalDestinationEtaSeconds : nav.etaSeconds
+    }
+
+    private var timeRemaining: String {
+        Self.hoursMinutes(etaCardSeconds)
+    }
+
+    private var arrivalTime: String {
+        let arr = Date().addingTimeInterval(etaCardSeconds)
+        return RideStatsFormatting.clock(arr, is24Hour: is24Hour)
+    }
+
+    /// Same formatting as `timeRemaining`, but for the FINAL destination
+    /// (`nav.finalDestinationEtaSeconds`) instead of the current leg.
+    private var finalTimeRemaining: String {
+        Self.hoursMinutes(nav.finalDestinationEtaSeconds)
+    }
+
+    /// "1h 23m" / "15 min" (integer division, no clamping).
+    private static func hoursMinutes(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        if h > 0 { return "\(h)h \(m)m" }
+        return "\(m) min"
+    }
+
+    /// Same formatting as `arrivalTime`, but for the FINAL destination.
+    private var finalArrivalTime: String {
+        let arr = Date().addingTimeInterval(nav.finalDestinationEtaSeconds)
+        return RideStatsFormatting.clock(arr, is24Hour: is24Hour)
+    }
+
+    /// SF Symbol for the UPCOMING maneuver. Reads the navigator's DERIVED
+    /// `upcomingManeuver` — the single place that pairs Apple's
+    /// end-of-polyline instruction text (from the arriving step) with the
+    /// arriving→departing turn geometry — so the HUD icon always agrees
+    /// with the dash glyph AND with the instruction text directly below
+    /// it. (Previously this re-ran the classifier on `nav.nextStep`, the
+    /// DEPARTING step, which both duplicated the pairing logic and, via the
+    /// text source, sat one maneuver ahead of the arrow.)
+    private var upcomingManeuverSymbol: String {
+        nav.upcomingManeuver?.sfSymbol ?? "arrow.up"
+    }
+}
