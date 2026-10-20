@@ -46,8 +46,9 @@ def test_manual_wifi_connect_bypasses_in_app_join():
     src = strip_comments(
         (REPO / "TripperDashPP" / "App" / "AppStatus.swift").read_text()
     )
-    body = src[src.index("func connect(to bike: SavedBike)"):]
-    body = body[:body.index("\n    /// The Wi-Fi join started")]
+    start = src.index("func connect(to bike: SavedBike)")
+    end = src.index("\n    func addBike(", start)
+    body = src[start:end]
     assert "bikeLink.connect()" in body
     assert "await wifiJoiner.ensureJoined" not in body
     assert "NEHotspotConfigurationManager" not in body
