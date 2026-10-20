@@ -368,6 +368,9 @@ extension LocationService: CLLocationManagerDelegate {
             let age = max(0, Date().timeIntervalSince(fix.timestamp))
             if let prev = self.lastFix {
                 let gap = fix.timestamp.timeIntervalSince(prev.timestamp)
+                if gap > 1.5 {
+                    self.log.info("fix gap \(gap, format: .fixed(precision: 1), privacy: .public) s (acc \(fix.horizontalAccuracy, format: .fixed(precision: 0), privacy: .public) m)")
+                }
                 self.log.info("GPS_FIX gap=\(gap, format: .fixed(precision: 2), privacy: .public)s age=\(age, format: .fixed(precision: 2), privacy: .public)s acc=\(fix.horizontalAccuracy, format: .fixed(precision: 0), privacy: .public)m speed=\(fix.speed, format: .fixed(precision: 1), privacy: .public)mps")
             } else {
                 self.log.info("GPS_FIX first age=\(age, format: .fixed(precision: 2), privacy: .public)s acc=\(fix.horizontalAccuracy, format: .fixed(precision: 0), privacy: .public)m")
