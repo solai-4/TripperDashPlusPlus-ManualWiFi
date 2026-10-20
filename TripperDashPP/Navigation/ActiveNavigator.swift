@@ -1120,6 +1120,10 @@ final class ActiveNavigator {
                 coord,
                 step.polyline.firstCoordinate ?? coord
             )
+            // Locked-screen lag diagnostic: confirm the distance is being
+            // recalculated on each GPS fix, and record the source fix age.
+            let fixAge = max(0, Date().timeIntervalSince(fix.timestamp))
+            log.info("NAV_DISTANCE next=\(self.distanceToNextStep, format: .fixed(precision: 1), privacy: .public)m fixAge=\(fixAge, format: .fixed(precision: 2), privacy: .public)s step=\(stepIdx, privacy: .public)")
             // F2c: secondary (look-ahead) maneuver = the step AFTER the
             // departing one. The distance from the rider to the SECONDARY
             // node is "distance to the primary node" plus the length of
