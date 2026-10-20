@@ -120,20 +120,13 @@ def test_observe_bike_link_rearms_before_await(app_src):
 # ── #3: Cancel during the Wi-Fi join ──────────────────────────────────────
 
 
-def test_connect_join_task_drops_stale_outcome(app_src):
+def test_manual_wifi_connect_starts_link_without_join_task(app_src):
+    """Manual-Wi-Fi mode must connect directly after the user joins in Settings."""
     body = _body(app_src, "func connect(to bike: SavedBike)")
     assert "joinTask?.cancel()" in body
-    assert "joinTask = Task { @MainActor in" in body
-    guard = "guard !Task.isCancelled, bikeLink.state == .connecting else { return }"
-    assert guard in body, (
-        "after the join await, a Cancel (.idle) or a newer flow must make the "
-        "outcome a no-op"
-    )
-    assert (
-        body.index("await wifiJoiner.ensureJoined")
-        < body.index(guard)
-        < body.index("switch outcome")
-    )
+    assert "bikeLink.connect()" in body
+    assert "await wifiJoiner.ensureJoined" not in body
+    assert "joinTask = Task { @MainActor in" not in body
 
 
 def test_report_join_failure_only_while_joining(link_src):
