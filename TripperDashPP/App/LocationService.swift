@@ -362,12 +362,15 @@ extension LocationService: CLLocationManagerDelegate {
         guard let latest = locations.last else { return }
         let fix = Fix(latest)
         Task { @MainActor in
-            // Field evidence for the GPS-dropout experiment (see applyMode).
+            // Field diagnostics for locked-screen navigation lag.
+            // "age" measures how old the GPS sample is when this callback
+            // reaches the main actor; "gap" measures time between GPS samples.
+            let age = max(0, Date().timeIntervalSince(fix.timestamp))
             if let prev = self.lastFix {
                 let gap = fix.timestamp.timeIntervalSince(prev.timestamp)
-                if gap > 1.5 {
-                    self.log.info("fix gap \(gap, format: .fixed(precision: 1), privacy: .public) s (acc \(fix.horizontalAccuracy, format: .fixed(precision: 0), privacy: .public) m)")
-                }
+                self.log.info("GPS_FIX gap=\(gap, format: .fixed(precision: 2), privacy: .public)s age=\(age, format: .fixed(precision: 2), privacy: .public)s acc=\(fix.horizontalAccuracy, format: .fixed(precision: 0), privacy: .public)m speed=\(fix.speed, format: .fixed(precision: 1), privacy: .public)mps")
+            } else {
+                self.log.info("GPS_FIX first age=\(age, format: .fixed(precision: 2), privacy: .public)s acc=\(fix.horizontalAccuracy, format: .fixed(precision: 0), privacy: .public)m")
             }
             self.lastFix = fix
             for handler in self.fixSubscribers.values { handler(fix) }
