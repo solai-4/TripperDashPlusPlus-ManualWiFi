@@ -26,7 +26,9 @@ def _src(rel: str) -> str:
 def test_send_path_has_no_main_actor_hop():
     src = _src("Stream/RtpStreamer.swift")
     start = decl_body(src, "func start()")
-    assert "queue.async { pipe.handle(nal) }" in start
+    assert "queue.async {" in start
+    assert "pipe.handle(nal)" in start
+    assert start.index("queue.async {") < start.index("pipe.handle(nal)")
     assert "handleEncodedNAL" not in src
 
     pipe = decl_body(src, "nonisolated final class RtpSendPipe: @unchecked Sendable {")

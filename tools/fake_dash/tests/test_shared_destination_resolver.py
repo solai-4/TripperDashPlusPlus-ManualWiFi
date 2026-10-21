@@ -432,11 +432,13 @@ class SwiftDriftGuards(unittest.TestCase):
         self.assertIn("showUnsupported", share)
 
     def test_deeplink_roundtrip_contract(self):
-        # encode + decode both present, scheme constant matches Info.plist
-        self.assertIn('static let scheme = "tripperdash"', self.deeplink)
+        # The latency-test app must use a separate scheme from the stable app.
+        self.assertIn('static let scheme = "tripperdash-latency"', self.deeplink)
         self.assertIn("func encode", self.deeplink)
         self.assertIn("func decode", self.deeplink)
         self.assertIn('name: "wp"', self.deeplink)
+        info = (SWIFT_DEEPLINK.parents[1] / "TripperDashPP-Info.plist").read_text()
+        self.assertIn("<string>tripperdash-latency</string>", info)
 
 
 if __name__ == "__main__":
