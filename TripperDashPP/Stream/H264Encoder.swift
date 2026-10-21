@@ -209,6 +209,7 @@ final class H264Encoder {
             frameProperties[kVTEncodeFrameOptionKey_ForceKeyFrame] = kCFBooleanTrue
             pendingForceKeyframe = false
         }
+        PipelineTiming.shared.encodeSubmitted(pts: presentationTime)
         var infoFlags = VTEncodeInfoFlags()
         let status = VTCompressionSessionEncodeFrame(
             session,
@@ -257,6 +258,7 @@ final class H264Encoder {
         }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        PipelineTiming.shared.encodeFinished(pts: pts)
 
         // On keyframes, extract SPS+PPS from the format description and
         // emit them BEFORE the IDR so the depacketizer can build a decoder.
