@@ -458,9 +458,9 @@ nonisolated final class PipelineTiming: @unchecked Sendable {
         }
     }
 
-    func note(_ message: @autoclosure () -> String) {
+    func note(_ message: String) {
         guard Self.isEnabled else { return }
-        log.notice("\(message(), privacy: .public)")
+        log.notice("\(message, privacy: .public)")
     }
 
     func frameRendered(pts: CMTime, tickStart: TimeInterval) {
