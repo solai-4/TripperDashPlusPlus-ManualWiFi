@@ -1156,6 +1156,7 @@ extension MapViewSource {
 
     private func tickOnMain() async {
         guard onFrame != nil else { return }
+        let tickStart = ProcessInfo.processInfo.systemUptime
 
         // The rider marker follows raw GPS fixes directly. There used to be a
         // MotionInterpolator here that dead-reckoned between the ~1 Hz fixes
@@ -1176,6 +1177,7 @@ extension MapViewSource {
 
         // 2. Render + emit this tick unconditionally (fixed 4 fps).
         let now = CACurrentMediaTime()
+        let renderStart = ProcessInfo.processInfo.systemUptime
 
         guard let buffer = renderMapViewToPixelBuffer() else {
             // Otherwise a missing frame would show up only as an
@@ -1192,6 +1194,13 @@ extension MapViewSource {
             framesMissed = 0
         }
 
+        if PipelineTiming.isEnabled {
+            PipelineTiming.shared.record(.render, ms: (ProcessInfo.processInfo.systemUptime - renderStart) * 1000)
+            if let f = lastFix {
+                PipelineTiming.shared.record(.fixAgeRender, ms: max(0, Date().timeIntervalSince(f.timestamp)) * 1000)
+            }
+        }
+
         // Real-time PTS from the monotonic clock (NOT frameIndex / fps) so
         // the RTP 90 kHz timestamps stay wall-clock-correct — robust even
         // if a tick is ever late under load.
@@ -1202,6 +1211,7 @@ extension MapViewSource {
             let state = UIApplication.shared.applicationState.rawValue
             log.info("frame tick #\(self.frameIndex, privacy: .public) (appState=\(state, privacy: .public))")
         }
+        PipelineTiming.shared.frameRendered(pts: pts, tickStart: tickStart)
         onFrame?(buffer, pts)
     }
 
@@ -1295,6 +1305,9 @@ extension MapViewSource {
         // for now in case we want to reintroduce a video-side hint
         // (e.g. for non-K1G dashes or for the in-app preview).
         // drawNavOverlay(into: ctx)
+
+        // Optional render-time stamp for phone-camera latency measurements.
+        drawTimingStamp(into: ctx)
 
         return buffer
     }
@@ -1404,7 +1417,8 @@ extension MapViewSource {
             drawVectorOnlyFrame(into: ctx)
             return
         }
-        drawProjectedTile(refTile, image: cg, riderCoord: fix.coordinate, into: ctx)
+        // Tile selection stays on the raw GPS fix; only drawing is predicted.
+        drawProjectedTile(refTile, image: cg, riderCoord: displayCoordinate(for: fix), into: ctx)
     }
 
     /// Off-corridor rescue frame. Reached when the rider has left the
@@ -1441,7 +1455,7 @@ extension MapViewSource {
             drawVectorOnlyFrame(into: ctx)
             return
         }
-        drawProjectedTile(tile, image: cg, riderCoord: fix.coordinate, into: ctx)
+        drawProjectedTile(tile, image: cg, riderCoord: displayCoordinate(for: fix), into: ctx)
     }
 
     /// Shared projection + composite for a SINGLE stitched tile centred
@@ -2005,10 +2019,11 @@ extension MapViewSource {
         // Same ground scale as the base tile layer (z=15 m/px at this
         // latitude; `currentZoom` is applied on top below, as in the tile
         // path), so dropping to this fallback doesn't jump the zoom.
-        let centerLat = fix.coordinate.latitude
+        let displayCoord = displayCoordinate(for: fix)
+        let centerLat = displayCoord.latitude
         let metersPerPx = WebMercator.metersPerPixel(latitude: centerLat,
                                                      zoom: MapViewSource.baseLayerZoom)
-        let centerLon = fix.coordinate.longitude
+        let centerLon = displayCoord.longitude
         let mPerDegLat = 111_320.0
         let mPerDegLon = 111_320.0 * cos(centerLat * .pi / 180)
 
@@ -3527,5 +3542,56 @@ extension MapViewSource {
         ctx.fillPath()
 
         ctx.restoreGState()
+    }
+}
+
+
+// MARK: - Latency compensation + timing stamp
+
+extension MapViewSource {
+    /// Below this speed, GPS course is too noisy to predict reliably.
+    private static let predictMinSpeedMPS: Double = 3.0
+    /// Stop predicting after a prolonged GPS gap to avoid runaway drift.
+    private static let predictMaxFixAgeSeconds: TimeInterval = 2.5
+    /// Initial downstream lead, configurable via UserDefaults / launch arguments.
+    private static let defaultLatencyLeadSeconds: Double = 0.5
+
+    private var latencyLeadSeconds: Double {
+        let defaults = UserDefaults.standard
+        let value = defaults.object(forKey: "dashLatencyLeadSeconds") == nil
+            ? Self.defaultLatencyLeadSeconds
+            : defaults.double(forKey: "dashLatencyLeadSeconds")
+        return min(max(value, 0), 3)
+    }
+
+    /// Stateless dead reckoning from the latest raw GPS fix. The tile-cache
+    /// lookup still uses the raw fix; only the displayed map origin is advanced.
+    private func displayCoordinate(for fix: Fix) -> CLLocationCoordinate2D {
+        guard fix.speed >= Self.predictMinSpeedMPS, fix.course >= 0 else { return fix.coordinate }
+        let age = min(max(Date().timeIntervalSince(fix.timestamp), 0), Self.predictMaxFixAgeSeconds)
+        let distance = fix.speed * (age + latencyLeadSeconds)
+        let bearing = fix.course * .pi / 180
+        let lat = fix.coordinate.latitude
+        let metersPerDegreeLatitude = 111_320.0
+        let metersPerDegreeLongitude = 111_320.0 * max(cos(lat * .pi / 180), 0.01)
+        return CLLocationCoordinate2D(
+            latitude: lat + distance * cos(bearing) / metersPerDegreeLatitude,
+            longitude: fix.coordinate.longitude + distance * sin(bearing) / metersPerDegreeLongitude
+        )
+    }
+
+    private static let stampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
+    }()
+
+    /// Optional timestamp burned into the video to measure phone-to-dash delay.
+    /// Disabled unless UserDefaults / launch arguments set dashTimingStamp=YES.
+    private func drawTimingStamp(into ctx: CGContext) {
+        guard UserDefaults.standard.bool(forKey: "dashTimingStamp") else { return }
+        let text = "\(Self.stampFormatter.string(from: Date())) #\(frameIndex)"
+        Self.drawText(text, in: ctx, at: CGPoint(x: 190, y: 22), width: 160, fontSize: 16, bold: true)
     }
 }

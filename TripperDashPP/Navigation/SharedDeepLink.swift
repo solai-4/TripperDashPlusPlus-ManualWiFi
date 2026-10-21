@@ -23,7 +23,7 @@ import Foundation
 
 enum SharedDeepLink {
 
-    static let scheme = "tripperdash"
+    static let scheme = "tripperdash-latency"
 
     /// Build a deep link from a resolution (used by the share extension).
     static func encode(_ resolution: ShareResolution) -> URL? {

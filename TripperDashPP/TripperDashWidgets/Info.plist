@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>TripperDash Widgets</string>
+	<string>TripperDash Test Widgets</string>
 
 	<!--
 	  These keys are normally injected by GENERATE_INFOPLIST_FILE. Because this

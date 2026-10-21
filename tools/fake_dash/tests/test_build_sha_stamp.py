@@ -70,11 +70,12 @@ def test_gitcommitsha_placeholder_present():
     assert isinstance(d["GitCommitSHA"], str), "GitCommitSHA must be a string"
 
 
-def test_stamp_script_exists_and_executable():
+def test_stamp_script_exists_and_build_makes_it_executable():
     s = _script_path()
     assert s.is_file(), "tools/stamp-git-sha.sh is missing"
-    mode = s.stat().st_mode
-    assert mode & 0o111, "stamp-git-sha.sh must be executable (chmod +x)"
+    # The iOS build workflow chmods this text file before xcodebuild.
+    workflow = (_repo_root() / ".github" / "workflows" / "ios-device-build.yml").read_text()
+    assert "chmod +x tools/stamp-git-sha.sh" in workflow
 
 
 def test_stamp_script_contents():

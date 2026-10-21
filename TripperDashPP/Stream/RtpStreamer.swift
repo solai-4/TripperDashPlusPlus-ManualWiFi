@@ -135,7 +135,11 @@ final class RtpStreamer {
         let pipe = self.pipe
         let queue = sendQueue
         encoder.onNAL = { @Sendable nal in
-            queue.async { pipe.handle(nal) }
+            let enqueuedAt = ProcessInfo.processInfo.systemUptime
+            queue.async {
+                PipelineTiming.shared.record(.sendQueue, ms: (ProcessInfo.processInfo.systemUptime - enqueuedAt) * 1000)
+                pipe.handle(nal)
+            }
         }
         do {
             try encoder.start()
@@ -301,6 +305,7 @@ nonisolated final class RtpSendPipe: @unchecked Sendable {
 
     /// Send-queue only.
     func handle(_ nal: EncodedNAL) {
+        let handleStart = ProcessInfo.processInfo.systemUptime
         // 90 kHz RTP timestamp = PTS seconds × 90000, plus the base.
         let ptsSeconds = CMTimeGetSeconds(nal.timestamp)
         let rtpTs = timestampBase &+ UInt32(truncatingIfNeeded: Int64(ptsSeconds * 90_000))
@@ -345,17 +350,22 @@ nonisolated final class RtpSendPipe: @unchecked Sendable {
             log.notice("rtp gap \(Int(frameGap * 1000), privacy: .public) ms")
         }
 
-        for datagram in datagrams {
-            send(datagram, on: link.connection)
+        for (index, datagram) in datagrams.enumerated() {
+            // Probe the last datagram of each frame to estimate how long
+            // Network.framework takes to process its send completion.
+            let probe: TimeInterval? = (isFrame && index == datagrams.count - 1 && PipelineTiming.isEnabled)
+                ? ProcessInfo.processInfo.systemUptime : nil
+            send(datagram, on: link.connection, probeStart: probe)
         }
 
         // Once per frame, not once per NAL — parameter sets don't count.
         if isFrame {
+            PipelineTiming.shared.frameHandedOff(pts: nal.timestamp, handleStart: handleStart)
             link.onFrame?()
         }
     }
 
-    private func send(_ datagram: RtpDatagram, on connection: NWConnection?) {
+    private func send(_ datagram: RtpDatagram, on connection: NWConnection?, probeStart: TimeInterval? = nil) {
         guard let connection else {
             lock.withLock { counters.packetsDropped += 1 }
             return
@@ -367,7 +377,138 @@ nonisolated final class RtpSendPipe: @unchecked Sendable {
                 self.log.warning("UDP send failed (seq=\(datagram.sequence)): \(err.localizedDescription)")
             } else {
                 self.lock.withLock { self.counters.packetsSent += 1 }
+                if let probeStart {
+                    PipelineTiming.shared.record(.udpComplete, ms: (ProcessInfo.processInfo.systemUptime - probeStart) * 1000)
+                }
             }
         })
+    }
+}
+
+// MARK: - Pipeline timing probe
+
+/// Optional phone-side latency measurement for location → render → encode →
+/// UDP hand-off, plus turn-card packet timing. It cannot measure time spent
+/// in the dash's own decoder/buffer; use the optional video timestamp overlay.
+nonisolated final class PipelineTiming: @unchecked Sendable {
+
+    nonisolated enum Stage: Int, CaseIterable, Sendable {
+        case fixAgeDeliver, fixAgeRender, render, encode, sendQueue, send, udpComplete, endToEnd, navFixAge, navSend
+
+        var label: String {
+            switch self {
+            case .fixAgeDeliver: return "fixAge@deliver"
+            case .fixAgeRender:  return "fixAge@render"
+            case .render:        return "render"
+            case .encode:        return "encode"
+            case .sendQueue:     return "sendQueue"
+            case .send:          return "send"
+            case .udpComplete:   return "udp"
+            case .endToEnd:      return "e2e"
+            case .navFixAge:     return "navFixAge"
+            case .navSend:       return "navSend"
+            }
+        }
+    }
+
+    static let shared = PipelineTiming()
+
+    static var isEnabled: Bool {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "dashTimingLogs") != nil {
+            return defaults.bool(forKey: "dashTimingLogs")
+        }
+        #if DEBUG
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    nonisolated private struct SampleAccumulator {
+        var count = 0
+        var sum = 0.0
+        var peak = 0.0
+    }
+
+    nonisolated private struct FrameMarks {
+        var tickStart: TimeInterval
+        var encodeSubmit: TimeInterval?
+    }
+
+    private let lock = NSLock()
+    private var accumulators = [SampleAccumulator](repeating: SampleAccumulator(), count: Stage.allCases.count)
+    private var frameMarks: [Int64: FrameMarks] = [:]
+    private var windowStart = ProcessInfo.processInfo.systemUptime
+    private let log = Logger(subsystem: "eu.kolaczek.tripperdashpp", category: "Timing")
+
+    private init() {}
+
+    func record(_ stage: Stage, ms: Double) {
+        guard Self.isEnabled, ms.isFinite, ms >= 0 else { return }
+        let summary: String? = lock.withLock {
+            let index = stage.rawValue
+            accumulators[index].count += 1
+            accumulators[index].sum += ms
+            accumulators[index].peak = max(accumulators[index].peak, ms)
+            return flushIfDueLocked()
+        }
+        if let summary {
+            log.notice("\(summary, privacy: .public)")
+        }
+    }
+
+    func note(_ message: String) {
+        guard Self.isEnabled else { return }
+        log.notice("\(message, privacy: .public)")
+    }
+
+    func frameRendered(pts: CMTime, tickStart: TimeInterval) {
+        guard Self.isEnabled else { return }
+        lock.withLock {
+            if frameMarks.count > 64 { frameMarks.removeAll(keepingCapacity: true) }
+            frameMarks[pts.value] = FrameMarks(tickStart: tickStart, encodeSubmit: nil)
+        }
+    }
+
+    func encodeSubmitted(pts: CMTime) {
+        guard Self.isEnabled else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.withLock { frameMarks[pts.value]?.encodeSubmit = now }
+    }
+
+    func encodeFinished(pts: CMTime) {
+        guard Self.isEnabled else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let submitted = lock.withLock { frameMarks[pts.value]?.encodeSubmit }
+        if let submitted {
+            record(.encode, ms: (now - submitted) * 1000)
+        }
+    }
+
+    func frameHandedOff(pts: CMTime, handleStart: TimeInterval) {
+        guard Self.isEnabled else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let tickStart = lock.withLock { frameMarks.removeValue(forKey: pts.value)?.tickStart }
+        record(.send, ms: (now - handleStart) * 1000)
+        if let tickStart {
+            record(.endToEnd, ms: (now - tickStart) * 1000)
+        }
+    }
+
+    private func flushIfDueLocked() -> String? {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - windowStart >= 1 else { return nil }
+        var parts: [String] = []
+        for stage in Stage.allCases {
+            let sample = accumulators[stage.rawValue]
+            guard sample.count > 0 else { continue }
+            let average = Int((sample.sum / Double(sample.count)).rounded())
+            let peak = Int(sample.peak.rounded())
+            parts.append("\(stage.label) \(average)/\(peak) n=\(sample.count)")
+        }
+        accumulators = [SampleAccumulator](repeating: SampleAccumulator(), count: Stage.allCases.count)
+        windowStart = now
+        return parts.isEmpty ? nil : "timing avg/max ms | " + parts.joined(separator: " | ")
     }
 }

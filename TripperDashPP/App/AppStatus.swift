@@ -1412,7 +1412,7 @@ final class AppStatus {
         // raw shared URL we resolve here.
         Task {
             let resolution: ShareResolution
-            if url.scheme?.lowercased() == "tripperdash" {
+            if url.scheme?.lowercased() == SharedDeepLink.scheme {
                 if (url.host ?? "").lowercased() == "open",
                    let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
                    let rawStr = comps.queryItems?.first(where: { $0.name == "url" })?.value,
