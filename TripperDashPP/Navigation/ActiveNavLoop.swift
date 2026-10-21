@@ -189,6 +189,19 @@ final class ActiveNavLoop {
         cameraAnnouncer.reset()
     }
 
+    /// Estimate how far the bike has travelled since the most recent GPS fix.
+    /// Used only to compensate the displayed turn distance; capped so stale
+    /// GPS cannot drive the displayed distance far below the true value.
+    private static let cardHoldCompensationSeconds: TimeInterval = 0.5
+    private static let cardMaxFixAgeSeconds: TimeInterval = 2.5
+    private static let cardMinSpeedMPS: Double = 3.0
+
+    static func metersTravelledSinceFix(_ fix: Fix?, now: Date = Date()) -> Double {
+        guard let fix, fix.speed >= cardMinSpeedMPS, fix.speed.isFinite else { return 0 }
+        let age = min(max(now.timeIntervalSince(fix.timestamp), 0), cardMaxFixAgeSeconds)
+        return fix.speed * (age + cardHoldCompensationSeconds)
+    }
+
     private func tick() async {
         guard let bikeLink = bikeLink,
               let nav = navigator
@@ -249,12 +262,16 @@ final class ActiveNavLoop {
         // which resolves Apple's end-of-polyline text convention in one
         // place so the bubble text can't drift a maneuver ahead of the arrow.
         let arrivingStep: MKRoute.Step? = nav.stepBeforeNext   // text + incoming leg
-        let distNext: Double = nav.distanceToNextStep
+        let tickStart = ProcessInfo.processInfo.systemUptime
+        let travelledSinceFix = Self.metersTravelledSinceFix(location?.lastFix)
+        let rawDistNext: Double = nav.distanceToNextStep
+        let distNext: Double = max(0, rawDistNext - travelledSinceFix)
         let distTotal: Double = nav.remainingDistance
         let etaSec: TimeInterval = nav.etaSeconds
         // F2c: secondary snapshot. Always read, decision-to-emit
-        // happens below.
-        let distSecond: Double = nav.distanceToSecondNextStep
+        // happens below; compensate by the same estimated travel distance.
+        let rawDistSecond: Double = nav.distanceToSecondNextStep
+        let distSecond: Double = rawDistSecond > 0 ? max(0, rawDistSecond - travelledSinceFix) : 0
         let isRerouting: Bool = nav.isRerouting
 
         // The upcoming maneuver (text-family + geometry-direction) resolved
@@ -420,6 +437,7 @@ final class ActiveNavLoop {
         }
 
         // 1. Push to wire.
+        let sendStart = ProcessInfo.processInfo.systemUptime
         await bikeLink.sendActiveNav(
             primaryManeuver: kind.wireByte,
             primaryDistanceMeters: primaryDist,
@@ -436,6 +454,14 @@ final class ActiveNavLoop {
             is24Hour: settings.is24Hour,
             remainingSeconds: remainingSecs
         )
+        if PipelineTiming.isEnabled {
+            let finished = ProcessInfo.processInfo.systemUptime
+            PipelineTiming.shared.record(.navSend, ms: (finished - sendStart) * 1000)
+            if let fix = location?.lastFix {
+                PipelineTiming.shared.record(.navFixAge, ms: max(0, Date().timeIntervalSince(fix.timestamp)) * 1000)
+            }
+            PipelineTiming.shared.note("nav-card dist raw \(Int(rawDistNext)) m -> sent \(Int(distNext)) m (comp \(Int(travelledSinceFix)) m), tick took \(Int((finished - tickStart) * 1000)) ms")
+        }
 
         // 2. Push to video compositor.
         let overlay = MapViewSource.NavOverlayState(
