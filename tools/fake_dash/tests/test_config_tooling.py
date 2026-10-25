@@ -20,39 +20,64 @@ def _gpx_tool():
     return mod
 
 
-def test_app_has_wifi_info_entitlement():
-    """NEHotspotNetwork.fetchCurrent returns nil without this entitlement, so
-    the SSID preflight in BikeLink / WiFiJoiner silently never works."""
+def test_manual_wifi_build_does_not_require_wifi_entitlements():
+    """Manual-Wi-Fi builds deliberately avoid paid hotspot entitlements."""
     with (REPO / "TripperDashPP" / "TripperDashPP.entitlements").open("rb") as f:
         ent = plistlib.load(f)
-    assert ent.get("com.apple.developer.networking.wifi-info") is True
-    assert ent.get("com.apple.developer.networking.HotspotConfiguration") is True
+    assert "com.apple.developer.networking.wifi-info" not in ent
+    assert "com.apple.developer.networking.HotspotConfiguration" not in ent
 
 
-def test_join_verify_ipv4_fallback_only_when_ssid_unreadable():
-    """A home router on 192.168.1.x must not satisfy the join check while the
-    SSID reads back as a different network (would end in notOnDashNetwork)."""
+def test_manual_wifi_joiner_prompts_for_settings_join():
+    """Manual-Wi-Fi build directs the rider to join from iOS Settings."""
     from tests.swift_source import strip_comments
 
     src = strip_comments(
         (REPO / "TripperDashPP" / "Tripper" / "WiFiJoiner.swift").read_text()
     )
-    assert "live == ssid || (live == nil && BikeLink.wifiHasDashSubnetIPv4())" in src
-    assert "live == ssid || BikeLink.wifiHasDashSubnetIPv4()" not in src
+    prompt = "Join the bike Wi-Fi manually in Settings → Wi-Fi, then retry."
+    assert src.count(prompt) >= 2
+    assert "func currentSSID() async -> String?" in src
 
 
-def test_join_failure_tells_rider_to_join_the_bike_wifi_manually():
-    """iOS can stay on a store/carrier Passpoint network it auto-joined (seen on
-    "HomeDepot-Passpoint") and the app can't disconnect it. A manual join in
-    Settings → Wi-Fi always wins, so both failure paths must say so: the join
-    check in WiFiJoiner and the connect preflight (notOnDashNetwork)."""
+def test_manual_wifi_connect_bypasses_in_app_join():
+    """Connecting uses the already-joined Wi-Fi; no in-app join task is required."""
     from tests.swift_source import strip_comments
 
-    tripper = REPO / "TripperDashPP" / "Tripper"
-    src = strip_comments((tripper / "WiFiJoiner.swift").read_text())
-    assert 'If it is, join \\"\\(ssid)\\" manually in Settings → Wi-Fi and retry.' in src
-    hs = strip_comments((tripper / "RsaHandshake.swift").read_text())
-    assert hs.count('Join \\"\\(expected)\\" manually in Settings → Wi-Fi and try again.') == 2
+    src = strip_comments(
+        (REPO / "TripperDashPP" / "App" / "AppStatus.swift").read_text()
+    )
+    start = src.index("func connect(to bike: SavedBike)")
+    end = src.index("func addBike(name:", start)
+    body = src[start:end]
+    assert "bikeLink.connect()" in body
+    assert "wifiJoiner.ensureJoined" not in body
+    assert "joinTask = Task {" not in body
+
+
+
+def test_connect_default_bike_shortcut_is_wired():
+    """The App Intent must use the app's selected bike and existing connect path."""
+    from tests.swift_source import strip_comments
+
+    app_dir = REPO / "TripperDashPP" / "App"
+    intent = strip_comments((app_dir / "ConnectBikeIntent.swift").read_text())
+    app_entry = strip_comments((app_dir / "TripperDashPPApp.swift").read_text())
+    settings = strip_comments((REPO / "TripperDashPP" / "UI" / "StreamingView.swift").read_text())
+    project = (REPO / "TripperDashPP" / "TripperDashPP.xcodeproj" / "project.pbxproj").read_text()
+
+    assert "struct ConnectDefaultBikeIntent: AppIntent" in intent
+    assert "struct TripperDashShortcuts: AppShortcutsProvider" in intent
+    assert "static let openAppWhenRun: Bool = true" in intent
+    assert "status.savedBikes.selected" in intent
+    assert "status.connect(to: bike)" in intent
+    assert "ShortcutBridge.shared.register(status)" in app_entry
+    assert "TripperDashShortcuts.updateAppShortcutParameters()" in app_entry
+    assert "status.savedBikes.selectedID == bike.id" in settings
+    assert "status.savedBikes.select(id: bike.id)" in settings
+    assert "Set as default vehicle" in settings
+    assert "ConnectBikeIntent.swift in Sources" in project
+    assert project.count("ConnectBikeIntent.swift") >= 4
 
 
 def test_gpx_poi_waypoints_are_not_spliced_into_track(tmp_path):

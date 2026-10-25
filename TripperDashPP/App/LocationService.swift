@@ -369,6 +369,10 @@ extension LocationService: CLLocationManagerDelegate {
                     self.log.info("fix gap \(gap, format: .fixed(precision: 1), privacy: .public) s (acc \(fix.horizontalAccuracy, format: .fixed(precision: 0), privacy: .public) m)")
                 }
             }
+            // Timing probe: age of this GPS sample when delivered to subscribers.
+            if PipelineTiming.isEnabled {
+                PipelineTiming.shared.record(.fixAgeDeliver, ms: max(0, Date().timeIntervalSince(fix.timestamp)) * 1000)
+            }
             self.lastFix = fix
             for handler in self.fixSubscribers.values { handler(fix) }
         }

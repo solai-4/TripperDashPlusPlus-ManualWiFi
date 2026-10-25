@@ -15,7 +15,7 @@
 	-->
 
 	<key>CFBundleDisplayName</key>
-	<string>TripperDash++</string>
+	<string>TripperDash++ Test</string>
 
 	<!--
 	  These keys are normally injected by GENERATE_INFOPLIST_FILE. Because

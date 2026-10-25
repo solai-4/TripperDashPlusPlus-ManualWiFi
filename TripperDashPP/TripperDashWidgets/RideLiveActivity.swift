@@ -77,7 +77,7 @@ struct RideLiveActivity: Widget {
                 ManeuverGlyph(symbol: context.state.maneuverSymbol,
                               rerouting: context.state.isRerouting)
             }
-            .widgetURL(URL(string: "tripperdash://ride"))
+            .widgetURL(URL(string: "tripperdash-latency://ride"))
             .keylineTint(.green)
         }
     }

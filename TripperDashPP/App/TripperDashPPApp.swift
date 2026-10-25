@@ -5,6 +5,7 @@
 //  App entry point. Sets up the root scene and shared app state.
 //
 
+import AppIntents
 import SwiftUI
 
 @main
@@ -18,6 +19,7 @@ struct TripperDashPPApp: App {
 
     init() {
         LiveActivityController.endOrphanedActivities()
+        TripperDashShortcuts.updateAppShortcutParameters()
     }
 
     var body: some Scene {
@@ -32,6 +34,9 @@ struct TripperDashPPApp: App {
                     status.handleIncomingURL(url)
                 }
                 .task {
+                    // Register the live app state for the Connect Default Bike shortcut.
+                    ShortcutBridge.shared.register(status)
+
                     // Once-per-launch eviction sweep — removes stale
                     // map tiles and brings the cache under its size
                     // cap. Runs on the actor so it can't race with

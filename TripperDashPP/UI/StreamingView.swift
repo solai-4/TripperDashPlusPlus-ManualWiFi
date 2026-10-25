@@ -42,16 +42,34 @@ struct StreamingView: View {
     /// is busy.
     @ViewBuilder
     private func bikeRow(_ bike: SavedBike) -> some View {
+        let isDefault = status.savedBikes.selectedID == bike.id
         HStack {
             Image(systemName: "bicycle")
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 2) {
-                Text(bike.displayName)
+                HStack(spacing: 5) {
+                    Text(bike.displayName)
+                    if isDefault {
+                        Text("Default")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
                 Text(bike.ssid)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Button {
+                status.savedBikes.select(id: bike.id)
+            } label: {
+                Image(systemName: isDefault ? "star.fill" : "star")
+                    .foregroundStyle(isDefault ? Color.accentColor : Color.secondary)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(isDefault ? "Default vehicle" : "Set as default vehicle")
+            .disabled(isDefault || status.bikeLink.demoMode || !isEditableState)
+
             Button("Connect") {
                 status.connect(to: bike)
                 dismiss()
@@ -106,7 +124,7 @@ struct StreamingView: View {
             } header: {
                 Text("Bikes")
             } footer: {
-                Text("Demo mode simulates the dash on-screen without the bike — for trying the app without hardware. Everything else (GPS, routing, voice) stays real; nothing is sent over Wi-Fi.")
+                Text("Tap the star to choose the default bike used by the Connect Default Bike shortcut. Connecting to a different bike also makes it the selected default. Manual-Wi-Fi mode requires the iPhone to be joined to that bike's Wi-Fi (or to auto-join it). Demo mode simulates the dash without hardware.")
             }
 
             Section("Dash display") {

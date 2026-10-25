@@ -26,7 +26,9 @@ def _src(rel: str) -> str:
 def test_send_path_has_no_main_actor_hop():
     src = _src("Stream/RtpStreamer.swift")
     start = decl_body(src, "func start()")
-    assert "queue.async { pipe.handle(nal) }" in start
+    assert "queue.async {" in start
+    assert "pipe.handle(nal)" in start
+    assert start.index("queue.async {") < start.index("pipe.handle(nal)")
     assert "handleEncodedNAL" not in src
 
     pipe = decl_body(src, "nonisolated final class RtpSendPipe: @unchecked Sendable {")
@@ -35,7 +37,10 @@ def test_send_path_has_no_main_actor_hop():
     handle = decl_body(pipe, "func handle(_ nal: EncodedNAL)")
     assert "packetizer.packetize(" in handle
     # Datagrams go out in packetizer order, then the one per-frame kick.
-    assert handle.index("for datagram in datagrams {") < handle.index("link.onFrame?()")
+    send_loop = "for (index, datagram) in datagrams.enumerated() {"
+    assert send_loop in handle
+    assert handle.index(send_loop) < handle.index("send(datagram, on: link.connection")
+    assert handle.index("send(datagram, on: link.connection") < handle.index("link.onFrame?()")
     send = decl_body(pipe, "private func send(")
     assert "self.lock.withLock { self.counters.packetsSent += 1 }" in send
 
