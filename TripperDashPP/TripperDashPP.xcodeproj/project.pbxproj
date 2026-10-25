@@ -44,6 +44,7 @@
 		A486F06A2FE2DD0800AA36C3 /* K1GPacket.swift in Sources */ = {isa = PBXBuildFile; fileRef = A486F0632FE2DD0800AA36C3 /* K1GPacket.swift */; };
 		A486F06B2FE2DD0800AA36C3 /* K1GConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A486F0622FE2DD0800AA36C3 /* K1GConstants.swift */; };
 		A4B6F0012FE6000000AA36C3 /* LocationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4B6F0002FE6000000AA36C3 /* LocationService.swift */; };
+		F01100000000000000000001 /* ConnectBikeIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = F01100000000000000000002 /* ConnectBikeIntent.swift */; };
 		A4C7000000000000000A1001 /* RideActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C7000000000000000A0001 /* RideActivityAttributes.swift */; };
 		A4C7000000000000000A2001 /* RideActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C7000000000000000A0001 /* RideActivityAttributes.swift */; };
 		A4C7000000000000000B1001 /* LiveActivityController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C7000000000000000B0001 /* LiveActivityController.swift */; };
@@ -215,6 +216,7 @@
 		A486F0632FE2DD0800AA36C3 /* K1GPacket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = K1GPacket.swift; sourceTree = "<group>"; };
 		A486F0642FE2DD0800AA36C3 /* RsaHandshake.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RsaHandshake.swift; sourceTree = "<group>"; };
 		A4B6F0002FE6000000AA36C3 /* LocationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocationService.swift; sourceTree = "<group>"; };
+		F01100000000000000000002 /* ConnectBikeIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectBikeIntent.swift; sourceTree = "<group>"; };
 		A4C7000000000000000A0001 /* RideActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RideActivityAttributes.swift; sourceTree = "<group>"; };
 		A4C7000000000000000B0001 /* LiveActivityController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityController.swift; sourceTree = "<group>"; };
 		A4C7000000000000000C0001 /* RideLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RideLiveActivity.swift; sourceTree = "<group>"; };
@@ -426,6 +428,7 @@
 			children = (
 				A486F0412FE2034700AA36C3 /* AppStatus.swift */,
 				A486F0422FE2034700AA36C3 /* TripperDashPPApp.swift */,
+				F01100000000000000000002 /* ConnectBikeIntent.swift */,
 				A4B6F0002FE6000000AA36C3 /* LocationService.swift */,
 				A4F0FFFF000000000000E001 /* VoiceNavigator.swift */,
 				A4DE70000000000000D00001 /* DemoDashModel.swift */,
@@ -887,6 +890,7 @@
 				7E5700000000000000000A66 /* RideHistoryView.swift in Sources */,
 				A486F04C2FE2034700AA36C3 /* RootView.swift in Sources */,
 				A4B6F0012FE6000000AA36C3 /* LocationService.swift in Sources */,
+				F01100000000000000000001 /* ConnectBikeIntent.swift in Sources */,
 				B1DEA1E700000000000000A1 /* WeatherAlertService.swift in Sources */,
 				B1DEA1E700000000000000B1 /* SpeedCameraService.swift in Sources */,
 				B1DEA1E700000000000000F1 /* SpeedCameraAnnouncer.swift in Sources */,

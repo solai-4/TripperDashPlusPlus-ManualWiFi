@@ -56,6 +56,25 @@ def test_manual_wifi_connect_bypasses_in_app_join():
 
 
 
+def test_connect_default_bike_shortcut_is_wired():
+    """The App Intent must use the app's selected bike and existing connect path."""
+    from tests.swift_source import strip_comments
+
+    app_dir = REPO / "TripperDashPP" / "App"
+    intent = strip_comments((app_dir / "ConnectBikeIntent.swift").read_text())
+    app_entry = strip_comments((app_dir / "TripperDashPPApp.swift").read_text())
+    project = (REPO / "TripperDashPP" / "TripperDashPP.xcodeproj" / "project.pbxproj").read_text()
+
+    assert "struct ConnectDefaultBikeIntent: AppIntent" in intent
+    assert "struct TripperDashShortcuts: AppShortcutsProvider" in intent
+    assert "static let openAppWhenRun: Bool = true" in intent
+    assert "status.savedBikes.selected" in intent
+    assert "status.connect(to: bike)" in intent
+    assert "ShortcutBridge.shared.register(status)" in app_entry
+    assert "ConnectBikeIntent.swift in Sources" in project
+    assert project.count("ConnectBikeIntent.swift") >= 4
+
+
 def test_gpx_poi_waypoints_are_not_spliced_into_track(tmp_path):
     gpx = tmp_path / "in.gpx"
     gpx.write_text(
