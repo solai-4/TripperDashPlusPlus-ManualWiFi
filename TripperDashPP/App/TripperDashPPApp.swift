@@ -18,6 +18,7 @@ struct TripperDashPPApp: App {
 
     init() {
         LiveActivityController.endOrphanedActivities()
+        TripperDashShortcuts.updateAppShortcutParameters()
     }
 
     var body: some Scene {

@@ -63,6 +63,7 @@ def test_connect_default_bike_shortcut_is_wired():
     app_dir = REPO / "TripperDashPP" / "App"
     intent = strip_comments((app_dir / "ConnectBikeIntent.swift").read_text())
     app_entry = strip_comments((app_dir / "TripperDashPPApp.swift").read_text())
+    settings = strip_comments((REPO / "TripperDashPP" / "UI" / "StreamingView.swift").read_text())
     project = (REPO / "TripperDashPP" / "TripperDashPP.xcodeproj" / "project.pbxproj").read_text()
 
     assert "struct ConnectDefaultBikeIntent: AppIntent" in intent
@@ -71,6 +72,10 @@ def test_connect_default_bike_shortcut_is_wired():
     assert "status.savedBikes.selected" in intent
     assert "status.connect(to: bike)" in intent
     assert "ShortcutBridge.shared.register(status)" in app_entry
+    assert "TripperDashShortcuts.updateAppShortcutParameters()" in app_entry
+    assert "status.savedBikes.selectedID == bike.id" in settings
+    assert "status.savedBikes.select(id: bike.id)" in settings
+    assert "Set as default vehicle" in settings
     assert "ConnectBikeIntent.swift in Sources" in project
     assert project.count("ConnectBikeIntent.swift") >= 4
 
